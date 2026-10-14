@@ -1,0 +1,22 @@
+# Fields to collect for each zoning district. Edit freely: add, remove, reorder, or reword.
+#
+# Each line is   column_name = "description"
+#   - column_name becomes a column in output/<town>/zones.csv (letters, digits, underscores)
+#   - description is what the model is told to look for, so be specific
+#
+# Values are kept as text with their units (e.g. "5,000 sq ft", "35 ft or 2.5 stories"),
+# because ordinances mix units and conditions. A field the document doesn't state is left blank.
+
+[fields]
+district_name = "Full name of the zoning district, e.g. 'Residence Multi-Family District'"
+district_type = "General category: residential, commercial, industrial, mixed-use, or other"
+permitted_uses = "Principal uses allowed as of right (not by special permit), as a short semicolon-separated list"
+special_permit_uses = "Uses allowed only by special permit or special exception, as a short semicolon-separated list"
+min_lot_area = "Minimum lot area, with units"
+min_lot_frontage = "Minimum lot frontage or lot width, with units"
+min_front_setback = "Minimum front yard setback, with units"
+min_side_setback = "Minimum side yard setback, with units (note if it differs per side or totals)"
+min_rear_setback = "Minimum rear yard setback, with units"
+max_height = "Maximum building height, in feet and/or stories as stated"
+max_lot_coverage = "Maximum building lot coverage, as a percentage"
+max_density = "Maximum residential density, e.g. dwelling units per acre or minimum lot area per dwelling unit"
