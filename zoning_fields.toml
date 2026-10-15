@@ -1,22 +1,71 @@
 # Fields to collect for each zoning district. Edit freely: add, remove, reorder, or reword.
 #
-# Each line is   column_name = "description"
-#   - column_name becomes a column in output/<town>/zones.csv (letters, digits, underscores)
-#   - description is what the model is told to look for, so be specific
+# Each field is a table:
+#   [fields.column_name]          column_name: letters, digits, underscores
+#   kind = "area"                 what sort of value it is (see below)
+#   description = "..."           what the model is told to look for, so be specific
 #
-# Values are kept as text with their units (e.g. "5,000 sq ft", "35 ft or 2.5 stories"),
-# because ordinances mix units and conditions. A field the document doesn't state is left blank.
+# Kinds, the units the model may report (as the document states them), and the standard units
+# the CSV uses. Python does all conversions; the model never converts units itself.
+#   text     free text                                   -> column_name
+#   area     sq_ft, acres, sq_m                          -> column_name_sq_ft
+#   length   ft, m                                       -> column_name_ft
+#   height   ft, m, stories                              -> column_name_ft and column_name_stories
+#   percent  percent                                     -> column_name_percent
+#   density  units_per_acre, sq_ft_per_unit, acres_per_unit -> column_name_units_per_acre
+#   count    count                                       -> column_name
+# Every non-text field also gets column_name_status (stated / not_applicable / not_found) and
+# column_name_raw (the document's exact wording). Values that don't reduce to a single number per
+# column (e.g. "the greater of 60 ft or 25 ft per unit") are left blank and listed in "flags".
 
-[fields]
-district_name = "Full name of the zoning district, e.g. 'Residence Multi-Family District'"
-district_type = "General category: residential, commercial, industrial, mixed-use, or other"
-permitted_uses = "Principal uses allowed as of right (not by special permit), as a short semicolon-separated list"
-special_permit_uses = "Uses allowed only by special permit or special exception, as a short semicolon-separated list"
-min_lot_area = "Minimum lot area, with units"
-min_lot_frontage = "Minimum lot frontage or lot width, with units"
-min_front_setback = "Minimum front yard setback, with units"
-min_side_setback = "Minimum side yard setback, with units (note if it differs per side or totals)"
-min_rear_setback = "Minimum rear yard setback, with units"
-max_height = "Maximum building height, in feet and/or stories as stated"
-max_lot_coverage = "Maximum building lot coverage, as a percentage"
-max_density = "Maximum residential density, e.g. dwelling units per acre or minimum lot area per dwelling unit"
+[fields.district_name]
+kind = "text"
+description = "Full name of the zoning district, e.g. 'Residence Multi-Family District'"
+
+[fields.district_type]
+kind = "text"
+description = "General category: residential, commercial, industrial, mixed-use, or other"
+
+[fields.permitted_uses]
+kind = "text"
+description = "Principal uses allowed as of right (not by special permit), as a short semicolon-separated list"
+
+[fields.special_permit_uses]
+kind = "text"
+description = "Uses allowed only by special permit or special exception, as a short semicolon-separated list"
+
+[fields.min_lot_area]
+kind = "area"
+description = "Minimum lot area"
+
+[fields.min_lot_frontage]
+kind = "length"
+description = "Minimum lot frontage or lot width"
+
+[fields.min_front_setback]
+kind = "length"
+description = "Minimum front yard setback"
+
+[fields.min_side_setback]
+kind = "length"
+description = "Minimum side yard setback for each side yard (not the total of both sides)"
+
+[fields.min_total_side_setback]
+kind = "length"
+description = "Minimum total of both side yards combined, if the document sets one"
+
+[fields.min_rear_setback]
+kind = "length"
+description = "Minimum rear yard setback"
+
+[fields.max_height]
+kind = "height"
+description = "Maximum building height"
+
+[fields.max_lot_coverage]
+kind = "percent"
+description = "Maximum building lot coverage"
+
+[fields.max_density]
+kind = "density"
+description = "Maximum residential density"

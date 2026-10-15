@@ -22,7 +22,7 @@ import streamlit as st
 from common import BASE_DIR, OUTPUT_DIR, read_id_list
 from models import EXTRACTORS
 from scraper import TOWNS
-from zoning import DOCS_DIR, FIELDS_FILE, default_model
+from zoning import DOCS_DIR, FIELDS_FILE, KINDS, default_model, standard_units
 
 UPLOADS_DIR = DOCS_DIR / "uploads"
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
@@ -177,7 +177,7 @@ def zoning_tab():
         args = ["zoning.py", "--town", town, "--doc", str(document), "--model", provider,
                 "--model-name", model_name, "--effort", effort]
         if zone_column != "Detect automatically":
-            args += ["--zone-column", zone_column]
+            args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
         if refresh:
             args.append("--refresh")
         show_result(*run_script(args))
@@ -189,32 +189,41 @@ def zoning_tab():
 # ---------------------------------------------------------------- Fields
 
 def fields_tab():
-    st.write("What the model collects for each zone. Each name becomes a column in zones.csv; "
-             "the description tells the model what to look for. Saving changes means saved zone "
-             "results are re-queried on the next run.")
+    st.write("What the model collects for each zone. Each name becomes a column in zones.csv (measurement "
+             "kinds become one column per standard unit, plus _status and _raw); the kind says what sort of "
+             "value it is; the description tells the model what to look for. Saving changes means saved "
+             "zone results are re-queried on the next run.")
+    st.caption("Kinds and units: " + " · ".join(
+        f"**{kind}** → {', '.join(standard_units(kind))}" for kind in KINDS if kind != "text"))
     fields = tomllib.loads(FIELDS_FILE.read_text(encoding="utf-8"))["fields"]
-    table = pd.DataFrame({"name": list(fields), "description": list(fields.values())})
+    table = pd.DataFrame({"name": list(fields),
+                          "kind": [spec.get("kind", "text") for spec in fields.values()],
+                          "description": [spec.get("description", "") for spec in fields.values()]})
     edited = st.data_editor(table, num_rows="dynamic", width="stretch", hide_index=True,
                             column_config={"name": st.column_config.TextColumn(width="medium"),
+                                           "kind": st.column_config.SelectboxColumn(options=list(KINDS)),
                                            "description": st.column_config.TextColumn(width="large")})
 
     if st.button("Save fields", type="primary"):
-        rows = [(str(r["name"] or "").strip(), str(r["description"] or "").strip()) for _, r in edited.iterrows()]
-        rows = [(n, d) for n, d in rows if n or d]  # ignore fully blank rows
+        rows = [tuple(str(r[c] or "").strip() for c in ("name", "kind", "description")) for _, r in edited.iterrows()]
+        rows = [r for r in rows if any(r)]  # ignore fully blank rows
         problems = [f"'{n}' isn't a valid name (letters, digits, underscores; can't start with a digit)"
-                    for n, _ in rows if not FIELD_NAME.match(n)]
-        problems += [f"'{n}' needs a description" for n, d in rows if not d]
-        names = [n for n, _ in rows]
+                    for n, _, _ in rows if not FIELD_NAME.match(n)]
+        problems += [f"'{n}' needs a kind" for n, k, _ in rows if k not in KINDS]
+        problems += [f"'{n}' needs a description" for n, _, d in rows if not d]
+        names = [n for n, _, _ in rows]
         problems += [f"'{n}' appears more than once" for n in sorted({n for n in names if names.count(n) > 1})]
         if problems:
             st.error("Not saved:\n\n" + "\n".join(f"- {p}" for p in problems))
         elif not rows:
             st.error("Not saved: at least one field is needed.")
         else:
-            # Keep the explanatory comments at the top of the file; rewrite only the [fields] section
-            header = FIELDS_FILE.read_text(encoding="utf-8").split("[fields]")[0]
-            body = "\n".join(f"{n} = {json.dumps(d, ensure_ascii=False)}" for n, d in rows)
-            FIELDS_FILE.write_text(f"{header}[fields]\n{body}\n", encoding="utf-8")
+            # Keep the explanatory comments at the top of the file (everything before the first line
+            # starting with "[fields."); rewrite the field tables below them
+            header = re.split(r"^\[fields\.", FIELDS_FILE.read_text(encoding="utf-8"), maxsplit=1, flags=re.M)[0]
+            body = "\n".join(f"[fields.{n}]\nkind = {json.dumps(k)}\ndescription = {json.dumps(d, ensure_ascii=False)}\n"
+                             for n, k, d in rows)
+            FIELDS_FILE.write_text(header + body, encoding="utf-8")
             st.success(f"Saved {len(rows)} fields.")
 
 

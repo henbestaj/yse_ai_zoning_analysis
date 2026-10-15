@@ -119,7 +119,7 @@ class GcloudGeminiExtractor(GeminiExtractor):
         # still bill to GOOGLE_CLOUD_PROJECT, so google-auth's warning about it is just noise
         warnings.filterwarnings("ignore", message="Your application has authenticated using end user credentials")
         return self.genai.Client(vertexai=True, project=_require_env("GOOGLE_CLOUD_PROJECT"),
-                                 location=os.environ.get("GOOGLE_CLOUD_LOCATION") or "global")
+                                 location=_require_env("GOOGLE_CLOUD_LOCATION"))
 
     def _prepare(self, path):
         data = path.read_bytes()
