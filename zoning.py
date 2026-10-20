@@ -1,28 +1,39 @@
-"""Build output/<town>/zones.csv: one row per zoning district used by the town's parcels, with the
-fields from zoning_fields.toml filled in from the town's zoning document by a model.
+"""Build a zones table: one row per zoning district, with the fields from zoning_fields.toml filled in
+from a zoning document by a model.
 
-Usage:
-    python zoning.py --town new_haven [--doc PATH] [--zone-column NAME] [--fields PATH] [--refresh]
+Two ways to say which districts:
+    python zoning.py --town new_haven [--doc PATH] [--zone-column NAME] [--decider clef]
+        A town with scraped data in scraper_output/<town>/; the zone codes come from that data.
+        The document defaults to zoning_docs/<town>.pdf.
+    python zoning.py --name "Hartford" --doc PATH --zones-file codes.txt
+        Anything else: give the document and a text file of zone codes, one per line.
+Both also take [--fields PATH] [--model-provider gemini|gcloud] [--model-name ID]
+[--model-effort low|medium|high] [--refresh].
 
-Run scraper.py for the town first. The document defaults to zoning_docs/<town>.pdf; --doc takes any
-file. Results are reused, with no model calls, for zones already in zones.csv when that file is newer
-than both the document and the fields file and came from the same document. --refresh redoes all.
+Results go to zoning_output/<towns|custom>/<town or name>/<provider>.<model>.<effort>/zones.csv,
+next to copies of the document and fields file that produced them. A zone is reused, with no model
+call, when it's already in that zones.csv and the document and fields file are byte-identical to
+those copies. --refresh redoes every zone.
 """
 
 import argparse
 import csv
+import filecmp
 import inspect
 import re
+import shutil
 import tomllib
 from pathlib import Path
 
-from common import BASE_DIR, OUTPUT_DIR, load_env, write_csv
+from common import BASE_DIR, SCRAPER_OUTPUT_DIR, load_env, read_id_list, write_csv
 from models import DECIDERS, EXTRACTORS, ModelError
-from scraper import TOWNS
 
 DOCS_DIR = BASE_DIR / "zoning_docs"
 FIELDS_FILE = BASE_DIR / "zoning_fields.toml"
-SKIP_FILES = {"zones.csv", "errors.csv"}
+ZONING_OUTPUT_DIR = BASE_DIR / "zoning_output"
+SAVED_DOC_STEM = "zoning_document"  # copies kept with each run's results
+SAVED_FIELDS = "zoning_fields.toml"
+SKIP_FILES = {"errors.csv"}  # scraper output that never holds zone codes
 YES_NO = {"yes", "no", "y", "n", "true", "false", "0", "1"}
 CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .\-/]{0,11}$")  # e.g. RM, RM2, BD-1, CBD, I-L
 MIN_CONFIDENCE = 0.6
@@ -54,6 +65,11 @@ KINDS = {
 STATUSES = ["stated", "not_applicable", "not_found"]
 
 
+def safe_name(text):
+    """Make text usable as a folder name: ':' and '/' (or '\\') become '-', spaces become '_'."""
+    return text.replace(":", "-").replace("/", "-").replace("\\", "-").replace(" ", "_")
+
+
 def standard_units(kind):
     """The output units for a kind, in order, e.g. height -> ["ft", "stories"]."""
     return list(dict.fromkeys(target for target, _ in KINDS[kind].values()))
@@ -71,17 +87,17 @@ def load_fields(path):
 
 def load_town_columns(town):
     """Return {(csv name, column name): [values]} for every CSV the scraper wrote for the town."""
-    town_dir = OUTPUT_DIR / town
-    if not town_dir.is_dir():
-        raise SystemExit(f"No scraped data in {town_dir}; run scraper.py --town {town} first.")
     columns = {}
-    for path in sorted(town_dir.glob("*.csv")):
+    for path in sorted((SCRAPER_OUTPUT_DIR / town).glob("*.csv")):
         if path.name in SKIP_FILES:
             continue
         with open(path, encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
                 for name, value in row.items():
                     columns.setdefault((path.name, name), []).append((value or "").strip())
+    if not columns:
+        raise SystemExit(f"No scraped data in scraper_output/{town}/; run scraper.py --town {town} first, "
+                         f"or use --name with --doc and --zones-file.")
     return columns
 
 
@@ -92,7 +108,7 @@ def looks_like_zone_codes(values):
     return sum(bool(CODE.match(v)) for v in present) >= 0.9 * len(present)
 
 
-def find_zone_column(town, columns, decider_name):
+def find_zone_column(place, columns, decider_name):
     """Rules first: a column named like 'zone' whose values look like codes. If that doesn't give
     exactly one answer, ask the decision model, and refuse to guess if it isn't confident."""
     candidates = [key for key, values in columns.items()
@@ -111,7 +127,7 @@ def find_zone_column(town, columns, decider_name):
         samples = list(dict.fromkeys(v for v in columns[(file, name)] if v))[:8]
         options[option] = f"Column '{name}' in {file}. Sample values: {', '.join(samples)}"
     choice, confidence = DECIDERS[decider_name]().choose(
-        state=f"Property records scraped from the {town.replace('_', ' ').title()} assessor website.",
+        state=f"Property records for {place}.",
         instructions="Which column holds each property's zoning district code (e.g. RM, RL, BA-1), "
                      "as defined in the town's zoning ordinance?",
         options=options)
@@ -120,6 +136,27 @@ def find_zone_column(town, columns, decider_name):
     if confidence < MIN_CONFIDENCE:
         raise SystemExit(f"Not confident enough ({confidence:.2f} < {MIN_CONFIDENCE}); pass --zone-column NAME.")
     return file, name
+
+
+def resolve_zone_column(spec, columns, town):
+    """Turn --zone-column into a (csv name, column name) key. Accepts "parcels.csv:Zone" or just "Zone".
+
+    File names can't contain ':', so the text before the first ':' is a file name only if it names one
+    of the town's CSVs; otherwise the whole text is the column name (names like "Land: Zone" contain
+    ':' themselves). A bare name found in several files stops with the choices instead of guessing.
+    """
+    file, sep, name = spec.partition(":")
+    if sep and file in {f for f, _ in columns}:
+        if (file, name) not in columns:
+            raise SystemExit(f"No column named {name!r} in scraper_output/{town}/{file}")
+        return file, name
+    matches = [key for key in columns if key[1] == spec]
+    if not matches:
+        raise SystemExit(f"No column named {spec!r} in scraper_output/{town}/")
+    if len(matches) > 1:
+        choices = "\n".join(f'  --zone-column "{f}:{n}"' for f, n in matches)
+        raise SystemExit(f"Column {spec!r} is in {len(matches)} files; say which one:\n{choices}")
+    return matches[0]
 
 
 def field_schema(spec):
@@ -182,12 +219,12 @@ def make_validator(fields):
     return validate
 
 
-def build_prompt(town, zone, fields):
+def build_prompt(place, zone, fields):
     field_lines = "\n".join(
         f"- {name} (text): {spec['description']}" if spec["kind"] == "text" else
         f"- {name} ({spec['kind']}; units: {', '.join(KINDS[spec['kind']])}): {spec['description']}"
         for name, spec in fields.items())
-    return f"""This document is the zoning regulations for {town.replace('_', ' ').title()}, Connecticut.
+    return f"""This document is the zoning regulations for {place}.
 Find the requirements for the zoning district with code "{zone}". Look in dimensional/bulk tables
 as well as the text.
 
@@ -252,43 +289,38 @@ def to_columns(result, fields):
     return row, flags
 
 
-def reusable_rows(zones_csv, document, fields_file, source, model, effort):
-    """Rows from an existing zones.csv that are still valid: the file is newer than the document and
-    the fields file, and the row came from the same document, model and effort as this run."""
+def saved_document(run_dir):
+    """The copy of the zoning document kept with a run's results, if there is one."""
+    return next(run_dir.glob(f"{SAVED_DOC_STEM}.*"), None)
+
+
+def reusable_rows(run_dir, document, fields_file):
+    """Rows from the run folder's zones.csv that are still valid: the document and fields file are
+    byte-identical to the copies saved with those results. Keyed case-insensitively by zone."""
+    zones_csv = run_dir / "zones.csv"
     if not zones_csv.exists():
         return {}
-    csv_time = zones_csv.stat().st_mtime
-    if csv_time <= document.stat().st_mtime or csv_time <= fields_file.stat().st_mtime:
-        print("zones.csv is older than the document or the fields file; re-querying all zones.")
+    saved_doc = saved_document(run_dir)
+    if saved_doc is None or not filecmp.cmp(document, saved_doc, shallow=False):
+        print("The zoning document differs from the one the saved results came from; re-querying all zones.")
+        return {}
+    saved_fields = run_dir / SAVED_FIELDS
+    if not saved_fields.exists() or not filecmp.cmp(fields_file, saved_fields, shallow=False):
+        print("The fields file differs from the one the saved results came from; re-querying all zones.")
         return {}
     with open(zones_csv, encoding="utf-8-sig", newline="") as f:
-        rows = [row for row in csv.DictReader(f) if row["source_document"] == source]
-    matching = {row["zone"].casefold(): row for row in rows  # keyed case-insensitively, like the zones
-                if row["model"] == model and row["effort"] == effort}
-    if len(matching) < len(rows):
-        print(f"{len(rows) - len(matching)} saved zone(s) came from a different model or effort; re-querying them.")
-    return matching
+        return {row["zone"].casefold(): row for row in csv.DictReader(f)}
 
 
-def resolve_zone_column(spec, columns, town):
-    """Turn --zone-column into a (csv name, column name) key. Accepts "parcels.csv:Zone" or just "Zone".
-
-    File names can't contain ':', so the text before the first ':' is a file name only if it names one
-    of the town's CSVs; otherwise the whole text is the column name (names like "Land: Zone" contain
-    ':' themselves). A bare name found in several files stops with the choices instead of guessing.
-    """
-    file, sep, name = spec.partition(":")
-    if sep and file in {f for f, _ in columns}:
-        if (file, name) not in columns:
-            raise SystemExit(f"No column named {name!r} in output/{town}/{file}")
-        return file, name
-    matches = [key for key in columns if key[1] == spec]
-    if not matches:
-        raise SystemExit(f"No column named {spec!r} in output/{town}/")
-    if len(matches) > 1:
-        choices = "\n".join(f'  --zone-column "{f}:{n}"' for f, n in matches)
-        raise SystemExit(f"Column {spec!r} is in {len(matches)} files; say which one:\n{choices}")
-    return matches[0]
+def save_inputs(run_dir, document, fields_file):
+    """Keep copies of the document and fields file next to the results they produced."""
+    target = run_dir / f"{SAVED_DOC_STEM}{document.suffix.lower()}"
+    if not (target.exists() and target.samefile(document)):  # --doc may point at the saved copy itself
+        for old in run_dir.glob(f"{SAVED_DOC_STEM}.*"):  # e.g. an earlier document of another file type
+            old.unlink()
+        shutil.copyfile(document, target)
+    if not (run_dir / SAVED_FIELDS).exists() or not (run_dir / SAVED_FIELDS).samefile(fields_file):
+        shutil.copyfile(fields_file, run_dir / SAVED_FIELDS)
 
 
 def default_model(extractor_class):
@@ -299,43 +331,69 @@ def default_model(extractor_class):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--town", required=True, choices=TOWNS)
-    parser.add_argument("--doc", type=Path, help="zoning document (default: zoning_docs/<town>.pdf)")
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--town", help="a town with scraped data in scraper_output/<town>/")
+    which.add_argument("--name", help="any name, for districts not taken from scraped data "
+                                      "(needs --doc and --zones-file)")
+    parser.add_argument("--doc", type=Path, help="zoning document (with --town, defaults to zoning_docs/<town>.pdf)")
+    parser.add_argument("--zones-file", type=Path, help="text file of zone codes, one per line (--name only)")
     parser.add_argument("--zone-column", help='column holding zone codes, e.g. "Zone" or "parcels.csv:Zone" '
-                                              "(skips detection; name the file if the column is in several)")
+                                              "(--town only; skips detection; name the file if the column is in several)")
+    parser.add_argument("--decider", choices=DECIDERS,
+                        help="decision model used if the zone column is unclear (--town only; default: clef)")
     parser.add_argument("--fields", type=Path, default=FIELDS_FILE, help="fields file (default: zoning_fields.toml)")
-    parser.add_argument("--model", default="gemini", choices=EXTRACTORS)
-    parser.add_argument("--model-name", help="override the provider's default model id")
-    parser.add_argument("--effort", default="high", choices=["low", "medium", "high"],
+    parser.add_argument("--model-provider", default="gemini", choices=EXTRACTORS,
+                        help="gemini (API key) or gcloud (Vertex AI) (default: gemini)")
+    parser.add_argument("--model-name", help="model id (default: the provider's default)")
+    parser.add_argument("--model-effort", default="high", choices=["low", "medium", "high"],
                         help="how much the model reasons before answering (default: high)")
-    parser.add_argument("--decider", default="clef", choices=DECIDERS)
     parser.add_argument("--refresh", action="store_true", help="re-query every zone, ignoring saved results")
     args = parser.parse_args()
+
+    if args.town:
+        if args.zones_file:
+            parser.error("--zones-file is only for --name; with --town the zones come from the scraped data")
+        place, document = args.town.replace("_", " ").title(), args.doc or DOCS_DIR / f"{args.town}.pdf"
+    else:
+        for option, value in (("--zone-column", args.zone_column), ("--decider", args.decider)):
+            if value:
+                parser.error(f"{option} is only for --town")
+        if not args.doc or not args.zones_file:
+            parser.error("--name needs both --doc and --zones-file")
+        place, document = args.name, args.doc
     load_env()
 
-    document = (args.doc or DOCS_DIR / f"{args.town}.pdf").resolve()
+    columns = load_town_columns(args.town) if args.town else None  # first: a town needs scraped data
+    document, fields_file = document.resolve(), args.fields.resolve()
     if not document.exists():
         raise SystemExit(f"Zoning document not found: {document}")
-    fields = load_fields(args.fields)
+    fields = load_fields(fields_file)
 
-    columns = load_town_columns(args.town)
-    if args.zone_column:
-        zone_column = resolve_zone_column(args.zone_column, columns, args.town)
+    if args.town:
+        if args.zone_column:
+            zone_column = resolve_zone_column(args.zone_column, columns, args.town)
+        else:
+            zone_column = find_zone_column(place, columns, args.decider or "clef")
+        codes = columns[zone_column]
     else:
-        zone_column = find_zone_column(args.town, columns, args.decider)
+        if not args.zones_file.exists():
+            raise SystemExit(f"Zones file not found: {args.zones_file}")
+        codes = read_id_list(args.zones_file)
+        if not codes:
+            raise SystemExit(f"No zone codes in {args.zones_file}")
     # One zone per code regardless of capitalization ("RM" and "rm"); keep the first spelling seen
     first_spelling = {}
-    for value in columns[zone_column]:
+    for value in codes:
         if value:
             first_spelling.setdefault(value.casefold(), value)
     zones = sorted(first_spelling.values(), key=str.casefold)
     print(f"{len(zones)} zones: {', '.join(zones)}")
 
-    source = str(document.relative_to(BASE_DIR)) if document.is_relative_to(BASE_DIR) else str(document)
-    zones_csv = OUTPUT_DIR / args.town / "zones.csv"
-    model = f"{args.model}/{args.model_name or default_model(EXTRACTORS[args.model])}"  # e.g. gemini/gemini-3.5-flash-lite
-    saved = {} if args.refresh else reusable_rows(zones_csv, document, args.fields.resolve(), source,
-                                                  model, args.effort)
+    model_name = args.model_name or default_model(EXTRACTORS[args.model_provider])
+    run_dir = (ZONING_OUTPUT_DIR / ("towns" if args.town else "custom") / safe_name(args.town or args.name)
+               / safe_name(f"{args.model_provider}.{model_name}.{args.model_effort}"))
+    zones_csv = run_dir / "zones.csv"
+    saved = {} if args.refresh else reusable_rows(run_dir, document, fields_file)
     todo = [z for z in zones if z.casefold() not in saved]
     print(f"Reusing {len(zones) - len(todo)} saved zone(s); querying {len(todo)}.")
 
@@ -343,19 +401,18 @@ def main():
     rows = {z: {**saved[z.casefold()], "zone": z} for z in zones if z.casefold() in saved}
     failed = []
     if todo:
-        kwargs = {"effort": args.effort, **({"model": args.model_name} if args.model_name else {})}
         try:
-            extractor = EXTRACTORS[args.model](**kwargs)
+            extractor = EXTRACTORS[args.model_provider](model=model_name, effort=args.model_effort)
         except ModelError as e:
             raise SystemExit(str(e))
         except ImportError as e:
             raise SystemExit(f"{e.name} isn't installed; run: uv pip install {e.name}")
-        print(f"Using {args.model} ({extractor.model}, effort {extractor.effort})")
+        print(f"Using {args.model_provider} ({extractor.model}, effort {extractor.effort})")
         schema, validate = build_schema(fields), make_validator(fields)
         for i, zone in enumerate(todo, 1):
             print(f"[{i}/{len(todo)}] {zone}")
             try:
-                result = extractor.extract(document, build_prompt(args.town, zone, fields), schema, validate)
+                result = extractor.extract(document, build_prompt(place, zone, fields), schema, validate)
             except ModelError as e:
                 print(f"  FAILED - {e}")
                 failed.append(zone)
@@ -364,14 +421,15 @@ def main():
             rows[zone] = {"zone": zone, **field_columns, "flags": "; ".join(flags),
                           "found_in_document": result["found_in_document"],
                           "source_pages": "; ".join(map(str, result["source_pages"])),
-                          "notes": result["notes"], "source_document": source,
-                          "model": model, "effort": args.effort}
+                          "notes": result["notes"]}
 
     # Only rewrite zones.csv when this run got something new back: an all-reused or all-failed run
-    # leaves the existing file (and its timestamp) alone
+    # leaves the existing results alone. The inputs are saved with the results they produced.
     if len(todo) > len(failed):
         write_csv(zones_csv, [rows[z] for z in zones if z in rows])
-    print(f"\n{len(rows)} zones in {zones_csv}" + (f"; failed (rerun to retry): {', '.join(failed)}" if failed else ""))
+        save_inputs(run_dir, document, fields_file)
+    print(f"\n{len(rows)} zones in {zones_csv.relative_to(BASE_DIR)}"
+          + (f"; failed (rerun to retry): {', '.join(failed)}" if failed else ""))
 
 
 if __name__ == "__main__":

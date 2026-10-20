@@ -1,7 +1,7 @@
 """Streamlit UI for the property scraper and the zoning table.
 
 The app doesn't reimplement anything: it runs the existing command-line scripts (scraper.py,
-zoning.py) as subprocesses, shows their output live, and offers the resulting CSVs for download.
+zoning.py) as subprocesses, shows their progress, and offers the resulting CSVs for download.
 
 Run from web_scraper/ with the project venv:
     streamlit run app.py
@@ -19,10 +19,10 @@ import zipfile
 import pandas as pd
 import streamlit as st
 
-from common import BASE_DIR, OUTPUT_DIR, read_id_list
-from models import EXTRACTORS
+from common import BASE_DIR, SCRAPER_OUTPUT_DIR, read_id_list
+from models import DECIDERS, EXTRACTORS
 from scraper import TOWNS
-from zoning import DOCS_DIR, FIELDS_FILE, KINDS, default_model, standard_units
+from zoning import DOCS_DIR, FIELDS_FILE, KINDS, ZONING_OUTPUT_DIR, default_model, safe_name, standard_units
 
 UPLOADS_DIR = DOCS_DIR / "uploads"
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
@@ -78,10 +78,10 @@ def read_csv(path):
         return pd.DataFrame()
 
 
-def download_outputs(town, only=None, key=""):
-    """Preview and download buttons for a town's CSVs (all of them, or just the names in `only`)."""
-    out_dir = OUTPUT_DIR / town
-    files = sorted(p for p in out_dir.glob("*.csv") if only is None or p.name in only) if out_dir.is_dir() else []
+def download_outputs(folder, label, only=None, key=""):
+    """Preview and download buttons for the CSVs in `folder` (all of them, or just the names in `only`).
+    `label` prefixes the downloaded file names."""
+    files = sorted(p for p in folder.glob("*.csv") if only is None or p.name in only) if folder.is_dir() else []
     if not files:
         st.info("No output files yet.")
         return
@@ -91,12 +91,12 @@ def download_outputs(town, only=None, key=""):
             for path in files:
                 zf.write(path, path.name)
         st.download_button(f"Download all ({len(files)} files, .zip)", buffer.getvalue(),
-                           file_name=f"{town}_outputs.zip", mime="application/zip", key=f"zip-{key}{town}")
+                           file_name=f"{label}_outputs.zip", mime="application/zip", key=f"zip-{key}{label}")
     for path in files:
         table = read_csv(path)
         with st.expander(f"{path.name}  ·  {len(table)} rows"):
-            st.download_button(f"Download {path.name}", path.read_bytes(), file_name=f"{town}_{path.name}",
-                               mime="text/csv", key=f"dl-{key}{town}-{path.name}")
+            st.download_button(f"Download {path.name}", path.read_bytes(), file_name=f"{label}_{path.name}",
+                               mime="text/csv", key=f"dl-{key}{label}-{path.name}")
             st.dataframe(table, width="stretch", hide_index=True)
 
 
@@ -130,60 +130,92 @@ def scraping_tab():
         show_result(*run_script(args))
 
     st.subheader(f"{town_label(town)} output files")
-    download_outputs(town, key="scrape-")
+    download_outputs(SCRAPER_OUTPUT_DIR / town, town, key="scrape-")
 
 
 # ---------------------------------------------------------------- Zoning
 
-def zoning_tab():
-    towns = [t for t in TOWNS if (OUTPUT_DIR / t / "parcels.csv").exists()]
-    if not towns:
-        st.info("Scrape a town first; the zoning table is built from its parcels.")
-        return
-    town = st.selectbox("Town", towns, format_func=town_label, key="zoning_town")
-
-    # Zoning document: the default for this town, a previously uploaded one, or a new upload
-    default_doc = DOCS_DIR / f"{town}.pdf"
+def choose_document(default, key):
+    """Pick the zoning document: the town's default (if any), an earlier upload, or a new upload.
+    Returns its path, or None until one is chosen."""
     uploads = sorted(UPLOADS_DIR.glob("*")) if UPLOADS_DIR.is_dir() else []
-    options = ([f"Default: {default_doc.name}"] if default_doc.exists() else []) + \
+    options = ([f"Default: {default.name}"] if default and default.exists() else []) + \
               [f"Uploaded: {p.name}" for p in uploads] + ["Upload a new document"]
-    choice = st.selectbox("Zoning document", options)
-    document = None
+    choice = st.selectbox("Zoning document", options, key=f"doc-{key}")
     if choice.startswith("Default"):
-        document = default_doc
-    elif choice.startswith("Uploaded"):
-        document = UPLOADS_DIR / choice.removeprefix("Uploaded: ")
-    else:
-        uploaded = st.file_uploader("Zoning document (PDF works best)")
-        if uploaded:
-            document = UPLOADS_DIR / uploaded.name
-            data = uploaded.getvalue()
-            # Only (re)write when the content changed: a newer file means saved results get redone
-            if not document.exists() or document.read_bytes() != data:
-                UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-                document.write_bytes(data)
-                st.success(f"Saved to zoning_docs/uploads/{uploaded.name}")
+        return default
+    if choice.startswith("Uploaded"):
+        return UPLOADS_DIR / choice.removeprefix("Uploaded: ")
+    uploaded = st.file_uploader("Zoning document (PDF works best)", key=f"upload-{key}")
+    if not uploaded:
+        return None
+    document = UPLOADS_DIR / uploaded.name
+    data = uploaded.getvalue()
+    if not document.exists() or document.read_bytes() != data:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        document.write_bytes(data)
+        st.success(f"Saved to zoning_docs/uploads/{uploaded.name}")
+    return document
 
-    parcel_columns = list(read_csv(OUTPUT_DIR / town / "parcels.csv").columns)
-    zone_column = st.selectbox("Zone column", ["Detect automatically"] + parcel_columns)
 
-    col1, col2, col3 = st.columns(3)
-    provider = col1.selectbox("Provider", list(EXTRACTORS))
-    model_name = col2.text_input("Model", value=default_model(EXTRACTORS[provider]), key=f"model-{provider}")
-    effort = col3.selectbox("Effort", ["high", "medium", "low"])
-    refresh = st.checkbox("Re-query every zone, ignoring saved results")
+def show_zoning_results(results_dir, label):
+    """Let the user pick one run (provider.model.effort folder) and preview/download its zones.csv."""
+    runs = sorted(p for p in results_dir.iterdir() if (p / "zones.csv").exists()) if results_dir.is_dir() else []
+    if not runs:
+        st.info("No zoning results yet.")
+        return
+    run = st.selectbox("Results from (provider.model.effort)", runs, format_func=lambda p: p.name,
+                       key=f"run-{results_dir}")
+    download_outputs(run, f"{label}_{run.name}", only={"zones.csv"}, key="zoning-")
 
-    if st.button("Build zoning table", type="primary", disabled=document is None):
-        args = ["zoning.py", "--town", town, "--doc", str(document), "--model", provider,
-                "--model-name", model_name, "--effort", effort]
+
+def zoning_tab():
+    mode = st.radio("Districts from", ["A scraped town", "A custom list"], horizontal=True)
+
+    if mode == "A scraped town":
+        towns = sorted(p.name for p in SCRAPER_OUTPUT_DIR.iterdir()
+                       if (p / "parcels.csv").exists()) if SCRAPER_OUTPUT_DIR.is_dir() else []
+        if not towns:
+            st.info("No scraped towns yet. Scrape one first, or use a custom list.")
+            return
+        town = st.selectbox("Town", towns, format_func=town_label, key="zoning_town")
+        document = choose_document(DOCS_DIR / f"{town}.pdf", key="town")
+        parcel_columns = list(read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv").columns)
+        col1, col2 = st.columns(2)
+        zone_column = col1.selectbox("Zone column", ["Detect automatically"] + parcel_columns)
+        decider = col2.selectbox("Decider (used if the zone column is unclear)", list(DECIDERS))
+        args = ["--town", town, "--decider", decider]
         if zone_column != "Detect automatically":
             args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
+        ready, results_dir, label = document is not None, ZONING_OUTPUT_DIR / "towns" / town, town
+    else:
+        name = st.text_input("Name (e.g. the town or county)").strip()
+        document = choose_document(None, key="custom")
+        codes = [c.strip() for c in st.text_area("Zone codes, one per line").splitlines() if c.strip()]
+        args, ready = [], bool(name and document and codes)
+        results_dir, label = ZONING_OUTPUT_DIR / "custom" / safe_name(name or "_"), safe_name(name or "custom")
+        if ready:
+            # zoning.py reads the codes from a text file; keep it with this name's results
+            zones_file = results_dir / "zone_codes.txt"
+            zones_file.parent.mkdir(parents=True, exist_ok=True)
+            zones_file.write_text("\n".join(codes) + "\n", encoding="utf-8")
+            args = ["--name", name, "--zones-file", str(zones_file)]
+
+    col1, col2, col3 = st.columns(3)
+    provider = col1.selectbox("Model provider", list(EXTRACTORS))
+    model_name = col2.text_input("Model name", value=default_model(EXTRACTORS[provider]), key=f"model-{provider}")
+    effort = col3.selectbox("Model effort", ["high", "medium", "low"])
+    refresh = st.checkbox("Re-query every zone, ignoring saved results")
+
+    if st.button("Build zoning table", type="primary", disabled=not ready):
+        args = ["zoning.py", *args, "--doc", str(document), "--model-provider", provider,
+                "--model-name", model_name, "--model-effort", effort]
         if refresh:
             args.append("--refresh")
         show_result(*run_script(args))
 
-    st.subheader(f"{town_label(town)} zoning table")
-    download_outputs(town, only={"zones.csv"}, key="zoning-")
+    st.subheader("Zoning results")
+    show_zoning_results(results_dir, label)
 
 
 # ---------------------------------------------------------------- Fields

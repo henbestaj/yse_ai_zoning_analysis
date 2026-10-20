@@ -1,4 +1,4 @@
-"""Scrape property records for a town's parcel list into CSVs under output/.
+"""Scrape property records for a town's parcel list into CSVs under scraper_output/<town>/.
 
 Usage:
     python scraper.py --town waterbury [--limit N] [--ids ID ...] [--refresh]
@@ -7,7 +7,7 @@ Usage:
 import argparse
 from collections import defaultdict
 
-from common import OUTPUT_DIR, FetchError, Session, read_id_list, write_csv
+from common import SCRAPER_OUTPUT_DIR, FetchError, Session, read_id_list, write_csv
 from towns import waterbury, new_haven
 
 TOWNS = {"waterbury": waterbury,
@@ -41,11 +41,11 @@ def main():
         for name, rows in parcel_tables.items():
             tables[name].extend({"parcel_id": parcel_id, **row} for row in rows)
 
-    write_csv(OUTPUT_DIR / args.town / "parcels.csv", parcels)
+    write_csv(SCRAPER_OUTPUT_DIR / args.town / "parcels.csv", parcels)
     for name, rows in tables.items():
-        write_csv(OUTPUT_DIR / args.town / f"{name}.csv", rows)
-    write_csv(OUTPUT_DIR / args.town / "errors.csv", errors)
-    print(f"\n{len(parcels)} ok, {len(errors)} failed. CSVs written to {OUTPUT_DIR}\\{args.town}")
+        write_csv(SCRAPER_OUTPUT_DIR / args.town / f"{name}.csv", rows)
+    write_csv(SCRAPER_OUTPUT_DIR / args.town / "errors.csv", errors)
+    print(f"\n{len(parcels)} ok, {len(errors)} failed. CSVs written to {SCRAPER_OUTPUT_DIR}\\{args.town}")
 
 
 if __name__ == "__main__":
