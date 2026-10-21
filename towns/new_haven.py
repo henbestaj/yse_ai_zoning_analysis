@@ -25,7 +25,7 @@ PANELS = ["panParcel", "panCurOwn", "panSlh", "panBldg", "panXF", "panLand", "pa
 GRID_TABLES = {"grdSales": "ownership_history", "grdXf": "extra_features", "grdOb": "outbuildings"}
 
 
-def fetch_page(session, pid, refresh=False, refresh_days=1):
+def fetch_page(session, pid, refresh, refresh_days):
     return cached_fetch(session, TOWN, pid, "parcel", PARCEL_URL.format(pid=pid),
                         refresh=refresh, refresh_days=refresh_days)
 
@@ -121,7 +121,7 @@ def parse_buildings(html, page_url):
     return buildings, sub_areas
 
 
-def scrape(session, raw_id, refresh=False, refresh_days=1):
+def scrape(session, raw_id, refresh, refresh_days):
     """Return (parcel_id, fields, tables) for one parcel."""
     pid = raw_id.strip()
     if not pid.isdigit():

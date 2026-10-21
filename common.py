@@ -22,6 +22,7 @@ USER_AGENT = (
 )
 MAX_ATTEMPTS = 4
 DELAY_RANGE = (1.0, 2.0)  # seconds to wait before every network request
+DEFAULT_REFRESH_DAYS = 1  # cached pages older than this are re-downloaded; the one place to change it
 
 
 class FetchError(Exception):
@@ -69,11 +70,12 @@ class Session:
                 last_error = f"HTTP {e.code}"
             except (urllib.error.URLError, TimeoutError) as e:
                 last_error = str(getattr(e, "reason", e))
-            time.sleep(2 ** attempt)  # 1, 2, 4, 8 s
+            if attempt < MAX_ATTEMPTS - 1:  # back off before the next try, not after the last one
+                time.sleep(2 ** attempt)  # 1, 2, 4 s
         raise FetchError(f"{last_error} after {MAX_ATTEMPTS} attempts for {url}")
 
 
-def cached_fetch(session, town, parcel_id, page, url, data=None, refresh=False, refresh_days=1):
+def cached_fetch(session, town, parcel_id, page, url, refresh, refresh_days, data=None):
     """Return the page's HTML, cached at cache/<town>/<parcel_id>_<page>.html.
 
     The cached copy is used if it's less than `refresh_days` old (and `refresh` is off); otherwise the

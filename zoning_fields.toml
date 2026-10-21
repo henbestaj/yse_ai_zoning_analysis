@@ -15,7 +15,8 @@
 #   density  units_per_acre, sq_ft_per_unit, acres_per_unit -> column_name_units_per_acre
 #   count    count                                       -> column_name
 # Every non-text field also gets column_name_status (stated / not_applicable / not_found) and
-# column_name_raw (the document's exact wording). Values that don't reduce to a single number per
+# column_name_raw (the document's exact wording). Every field gets column_name_pages (the PDF pages
+# its value came from). Values that don't reduce to a single number per
 # column (e.g. "the greater of 60 ft or 25 ft per unit") are left blank and listed in "flags".
 
 [fields.district_name]
@@ -68,4 +69,4 @@ description = "Maximum building lot coverage"
 
 [fields.max_density]
 kind = "density"
-description = "Maximum residential density"
+description = "Maximum residential density measured against lot area (e.g. dwelling units per acre, or minimum lot area per dwelling unit). Density measured against building floor area (e.g. '1 unit per 1,000 sq ft of gross floor area') is NOT lot density: don't report it here; mention it in notes instead"

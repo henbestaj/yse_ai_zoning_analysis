@@ -5,8 +5,8 @@ Two ways to say which districts:
     python zoning.py --town new_haven [--doc PATH] [--zone-column NAME] [--decider clef]
         A town with scraped data in scraper_output/<town>/; the zone codes come from that data.
         The document defaults to zoning_docs/<town>.pdf.
-    python zoning.py --name "Hartford" --doc PATH --zones-file codes.txt
-        Anything else: give the document and a text file of zone codes, one per line.
+    python zoning.py --name "Hartford" --doc PATH --zones RM RL CBD
+        Anything else: give the document and the zone codes.
 Both also take [--fields PATH] [--model-provider gemini|gcloud] [--model-name ID]
 [--model-effort low|medium|high] [--refresh].
 
@@ -25,7 +25,7 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from common import BASE_DIR, SCRAPER_OUTPUT_DIR, load_env, read_id_list, write_csv
+from common import BASE_DIR, SCRAPER_OUTPUT_DIR, load_env, write_csv
 from models import DECIDERS, EXTRACTORS, ModelError
 
 DOCS_DIR = BASE_DIR / "zoning_docs"
@@ -66,8 +66,9 @@ STATUSES = ["stated", "not_applicable", "not_found"]
 
 
 def safe_name(text):
-    """Make text usable as a folder name: ':' and '/' (or '\\') become '-', spaces become '_'."""
-    return text.replace(":", "-").replace("/", "-").replace("\\", "-").replace(" ", "_")
+    """Make text usable as a folder name: characters Windows forbids (< > : " / \\ | ? *) become '-',
+    spaces become '_', and trailing dots are dropped (Windows silently strips them)."""
+    return re.sub(r'[<>:"/\\|?*]', "-", text).replace(" ", "_").rstrip(".")
 
 
 def standard_units(kind):
@@ -97,7 +98,7 @@ def load_town_columns(town):
                     columns.setdefault((path.name, name), []).append((value or "").strip())
     if not columns:
         raise SystemExit(f"No scraped data in scraper_output/{town}/; run scraper.py --town {town} first, "
-                         f"or use --name with --doc and --zones-file.")
+                         f"or use --name with --doc and --zones.")
     return columns
 
 
@@ -159,19 +160,27 @@ def resolve_zone_column(spec, columns, town):
     return matches[0]
 
 
+PAGES_SCHEMA = {"type": "array", "items": {"type": "integer"},
+                "description": "PDF page numbers (1 = first page of the file) this field's value came from"}
+
+
 def field_schema(spec):
-    """JSON schema for one field: text or null, or a measurement with a status and allowed units."""
+    """JSON schema for one field: a text value, or a measurement with a status and allowed units;
+    either way with the pages it came from."""
     if spec["kind"] == "text":
-        return {"type": ["string", "null"], "description": spec["description"]}
+        return {"type": "object", "description": spec["description"], "required": ["value", "pages"],
+                "properties": {"value": {"type": ["string", "null"]}, "pages": PAGES_SCHEMA}}
     measurement = {"type": "object", "required": ["value", "unit"], "properties": {
         "value": {"type": "number"},
         "unit": {"type": "string", "enum": list(KINDS[spec["kind"]])},
     }}
-    return {"type": "object", "description": spec["description"], "required": ["status", "measurements", "raw"],
+    return {"type": "object", "description": spec["description"],
+            "required": ["status", "measurements", "raw", "pages"],
             "properties": {
                 "status": {"type": "string", "enum": STATUSES},
                 "measurements": {"type": "array", "items": measurement},
                 "raw": {"type": ["string", "null"], "description": "The document's exact wording"},
+                "pages": PAGES_SCHEMA,
             }}
 
 
@@ -179,8 +188,6 @@ def build_schema(fields):
     properties = {name: field_schema(spec) for name, spec in fields.items()}
     properties["found_in_document"] = {"type": "boolean",
                                        "description": "Whether the document defines this district at all"}
-    properties["source_pages"] = {"type": "array", "items": {"type": "integer"},
-                                  "description": "PDF page numbers (1 = first page of the file) the values came from"}
     properties["notes"] = {"type": "string",
                            "description": "Anything a reviewer should know: ambiguities, conditions, exceptions"}
     return {"type": "object", "properties": properties, "required": list(properties)}
@@ -188,16 +195,21 @@ def build_schema(fields):
 
 def make_validator(fields):
     def validate(result):
-        missing = [k for k in [*fields, "found_in_document", "source_pages", "notes"] if k not in result]
+        missing = [k for k in [*fields, "found_in_document", "notes"] if k not in result]
         if missing:
             raise ValueError(f"missing keys {missing}")
         for name, spec in fields.items():
             value = result[name]
+            if not isinstance(value, dict):
+                raise ValueError(f"{name}: not an object")
+            pages = value.get("pages")
+            if not isinstance(pages, list) or not all(isinstance(p, int) and not isinstance(p, bool) for p in pages):
+                raise ValueError(f"{name}: pages must be a list of integers")
             if spec["kind"] == "text":
-                if value is not None and not isinstance(value, str):
+                if value.get("value") is not None and not isinstance(value["value"], str):
                     raise ValueError(f"{name}: not text")
                 continue
-            if not isinstance(value, dict) or value.get("status") not in STATUSES:
+            if value.get("status") not in STATUSES:
                 raise ValueError(f"{name}: missing or unknown status")
             measurements = value.get("measurements")
             units = KINDS[spec["kind"]]
@@ -212,8 +224,6 @@ def make_validator(fields):
                 raise ValueError(f"{name}: raw is not text")
         if not isinstance(result["found_in_document"], bool):
             raise ValueError("found_in_document is not true/false")
-        if not isinstance(result["source_pages"], list) or not all(isinstance(p, int) for p in result["source_pages"]):
-            raise ValueError("source_pages must be a list of integers")
         if not isinstance(result["notes"], str):
             raise ValueError("notes is not text")
     return validate
@@ -227,6 +237,9 @@ def build_prompt(place, zone, fields):
     return f"""This document is the zoning regulations for {place}.
 Find the requirements for the zoning district with code "{zone}". Look in dimensional/bulk tables
 as well as the text.
+
+Every field: give pages, the page numbers of the file (1 = first page, not printed page labels)
+its value came from; empty if not found.
 
 Text fields: give the value as the document states it, or null if it doesn't.
 
@@ -245,8 +258,8 @@ follows another one's rules (then say so in notes).
 Fields:
 {field_lines}
 
-Also return found_in_document (false if the document doesn't define district "{zone}" at all),
-source_pages (page numbers of the file, 1 = first page, not printed page labels), and notes."""
+Also return found_in_document (false if the document doesn't define district "{zone}" at all)
+and notes."""
 
 
 def _number(x):
@@ -261,13 +274,15 @@ def to_columns(result, fields):
     Text fields pass through. Measurements are converted to standard units, one column per unit
     (<field>_<unit>), next to <field>_status and <field>_raw. A unit column holds a number only when
     the requirement reduces to exactly one value for it; anything else is left blank and flagged
-    for a person to check.
+    for a person to check. Every field also gets <field>_pages.
     """
     row, flags = {}, []
     for name, spec in fields.items():
         value = result[name]
+        pages = "; ".join(map(str, value["pages"]))
         if spec["kind"] == "text":
-            row[name] = value or ""
+            row[name] = value["value"] or ""
+            row[f"{name}_pages"] = pages
             continue
         converted = {unit: [] for unit in standard_units(spec["kind"])}
         for m in value["measurements"]:
@@ -284,6 +299,7 @@ def to_columns(result, fields):
                 flags.append(f"{name}: several {unit} values ({', '.join(map(_number, distinct))})")
         row[f"{name}_status"] = value["status"]
         row[f"{name}_raw"] = value["raw"] or ""
+        row[f"{name}_pages"] = pages
         if value["status"] == "stated" and not value["measurements"]:
             flags.append(f"{name}: stated, but not as a number")
     return row, flags
@@ -334,9 +350,9 @@ def main():
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--town", help="a town with scraped data in scraper_output/<town>/")
     which.add_argument("--name", help="any name, for districts not taken from scraped data "
-                                      "(needs --doc and --zones-file)")
+                                      "(needs --doc and --zones)")
     parser.add_argument("--doc", type=Path, help="zoning document (with --town, defaults to zoning_docs/<town>.pdf)")
-    parser.add_argument("--zones-file", type=Path, help="text file of zone codes, one per line (--name only)")
+    parser.add_argument("--zones", nargs="+", help="the zone codes to look up, e.g. --zones RM RL CBD (--name only)")
     parser.add_argument("--zone-column", help='column holding zone codes, e.g. "Zone" or "parcels.csv:Zone" '
                                               "(--town only; skips detection; name the file if the column is in several)")
     parser.add_argument("--decider", choices=DECIDERS,
@@ -351,15 +367,15 @@ def main():
     args = parser.parse_args()
 
     if args.town:
-        if args.zones_file:
-            parser.error("--zones-file is only for --name; with --town the zones come from the scraped data")
+        if args.zones:
+            parser.error("--zones is only for --name; with --town the zones come from the scraped data")
         place, document = args.town.replace("_", " ").title(), args.doc or DOCS_DIR / f"{args.town}.pdf"
     else:
         for option, value in (("--zone-column", args.zone_column), ("--decider", args.decider)):
             if value:
                 parser.error(f"{option} is only for --town")
-        if not args.doc or not args.zones_file:
-            parser.error("--name needs both --doc and --zones-file")
+        if not args.doc or not args.zones:
+            parser.error("--name needs both --doc and --zones")
         place, document = args.name, args.doc
     load_env()
 
@@ -376,11 +392,10 @@ def main():
             zone_column = find_zone_column(place, columns, args.decider or "clef")
         codes = columns[zone_column]
     else:
-        if not args.zones_file.exists():
-            raise SystemExit(f"Zones file not found: {args.zones_file}")
-        codes = read_id_list(args.zones_file)
+        # argparse already requires at least one value; this also catches blank ones like --zones ""
+        codes = [code.strip() for code in args.zones if code.strip()]
         if not codes:
-            raise SystemExit(f"No zone codes in {args.zones_file}")
+            raise SystemExit("No zone codes given; pass them after --zones")
     # One zone per code regardless of capitalization ("RM" and "rm"); keep the first spelling seen
     first_spelling = {}
     for value in codes:
@@ -419,9 +434,7 @@ def main():
                 continue
             field_columns, flags = to_columns(result, fields)
             rows[zone] = {"zone": zone, **field_columns, "flags": "; ".join(flags),
-                          "found_in_document": result["found_in_document"],
-                          "source_pages": "; ".join(map(str, result["source_pages"])),
-                          "notes": result["notes"]}
+                          "found_in_document": result["found_in_document"], "notes": result["notes"]}
 
     # Only rewrite zones.csv when this run got something new back: an all-reused or all-failed run
     # leaves the existing results alone. The inputs are saved with the results they produced.

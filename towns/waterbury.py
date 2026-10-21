@@ -20,7 +20,7 @@ PAGES = {
 }
 
 
-def fetch_pages(session, unique_id, mbl, refresh=False, refresh_days=1):
+def fetch_pages(session, unique_id, mbl, refresh, refresh_days):
     """Return {tab name: html} for one parcel, using the cache where possible."""
     return {
         page: cached_fetch(session, TOWN, unique_id, page,
@@ -125,7 +125,7 @@ def parse_maps(html):
     return maps
 
 
-def scrape(session, raw_id, refresh=False, refresh_days=1):
+def scrape(session, raw_id, refresh, refresh_days):
     """Return (parcel_id, fields, tables) for one parcel."""
     unique_id = raw_id.strip()
     if len(unique_id) != 12 or not unique_id.isdigit():

@@ -7,24 +7,26 @@ Run from web_scraper/ with the project venv:
     streamlit run app.py
 """
 
+import contextlib
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import zipfile
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from common import BASE_DIR, SCRAPER_OUTPUT_DIR, read_id_list
+from common import BASE_DIR, DEFAULT_REFRESH_DAYS, SCRAPER_OUTPUT_DIR, read_id_list
 from models import DECIDERS, EXTRACTORS
 from scraper import TOWNS
 from zoning import DOCS_DIR, FIELDS_FILE, KINDS, ZONING_OUTPUT_DIR, default_model, safe_name, standard_units
 
-UPLOADS_DIR = DOCS_DIR / "uploads"
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
 FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -119,7 +121,8 @@ def scraping_tab():
 
     with st.expander("Options"):
         refresh = st.checkbox("Re-download every page, ignoring the cache")
-        refresh_days = st.number_input("Re-download cached pages older than (days)", min_value=0, value=1)
+        refresh_days = st.number_input("Re-download cached pages older than (days)", min_value=0,
+                                       value=DEFAULT_REFRESH_DAYS)
 
     if st.button(f"Scrape {len(ids)} parcels", type="primary", disabled=not ids):
         args = ["scraper.py", "--town", town, "--refresh_days", str(refresh_days)]
@@ -136,26 +139,28 @@ def scraping_tab():
 # ---------------------------------------------------------------- Zoning
 
 def choose_document(default, key):
-    """Pick the zoning document: the town's default (if any), an earlier upload, or a new upload.
-    Returns its path, or None until one is chosen."""
-    uploads = sorted(UPLOADS_DIR.glob("*")) if UPLOADS_DIR.is_dir() else []
-    options = ([f"Default: {default.name}"] if default and default.exists() else []) + \
-              [f"Uploaded: {p.name}" for p in uploads] + ["Upload a new document"]
-    choice = st.selectbox("Zoning document", options, key=f"doc-{key}")
-    if choice.startswith("Default"):
+    """Pick the zoning document: the town's default (if any) or an upload. Returns a path, an
+    uploaded file (kept in memory), or None until one is chosen."""
+    options = ([f"Default: {default.name}"] if default and default.exists() else []) + ["Upload a document"]
+    if st.selectbox("Zoning document", options, key=f"doc-{key}").startswith("Default"):
         return default
-    if choice.startswith("Uploaded"):
-        return UPLOADS_DIR / choice.removeprefix("Uploaded: ")
-    uploaded = st.file_uploader("Zoning document (PDF works best)", key=f"upload-{key}")
-    if not uploaded:
-        return None
-    document = UPLOADS_DIR / uploaded.name
-    data = uploaded.getvalue()
-    if not document.exists() or document.read_bytes() != data:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        document.write_bytes(data)
-        st.success(f"Saved to zoning_docs/uploads/{uploaded.name}")
-    return document
+    return st.file_uploader("Zoning document (PDF works best)", key=f"upload-{key}")
+
+
+@contextlib.contextmanager
+def document_on_disk(document):
+    """Yield a path zoning.py can read. An upload is written to a temporary file only for the run and
+    deleted afterwards (even if the run is interrupted); zoning.py keeps its own copy with the results."""
+    if isinstance(document, Path):
+        yield document
+        return
+    fd, path = tempfile.mkstemp(suffix=Path(document.name).suffix.lower())  # suffix tells the model the file type
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(document.getvalue())
+        yield Path(path)
+    finally:
+        os.unlink(path)
 
 
 def show_zoning_results(results_dir, label):
@@ -192,14 +197,8 @@ def zoning_tab():
         name = st.text_input("Name (e.g. the town or county)").strip()
         document = choose_document(None, key="custom")
         codes = [c.strip() for c in st.text_area("Zone codes, one per line").splitlines() if c.strip()]
-        args, ready = [], bool(name and document and codes)
+        args, ready = ["--name", name, "--zones", *codes], bool(name and document and codes)
         results_dir, label = ZONING_OUTPUT_DIR / "custom" / safe_name(name or "_"), safe_name(name or "custom")
-        if ready:
-            # zoning.py reads the codes from a text file; keep it with this name's results
-            zones_file = results_dir / "zone_codes.txt"
-            zones_file.parent.mkdir(parents=True, exist_ok=True)
-            zones_file.write_text("\n".join(codes) + "\n", encoding="utf-8")
-            args = ["--name", name, "--zones-file", str(zones_file)]
 
     col1, col2, col3 = st.columns(3)
     provider = col1.selectbox("Model provider", list(EXTRACTORS))
@@ -208,11 +207,12 @@ def zoning_tab():
     refresh = st.checkbox("Re-query every zone, ignoring saved results")
 
     if st.button("Build zoning table", type="primary", disabled=not ready):
-        args = ["zoning.py", *args, "--doc", str(document), "--model-provider", provider,
-                "--model-name", model_name, "--model-effort", effort]
-        if refresh:
-            args.append("--refresh")
-        show_result(*run_script(args))
+        with document_on_disk(document) as path:
+            args = ["zoning.py", *args, "--doc", str(path), "--model-provider", provider,
+                    "--model-name", model_name, "--model-effort", effort]
+            if refresh:
+                args.append("--refresh")
+            show_result(*run_script(args))
 
     st.subheader("Zoning results")
     show_zoning_results(results_dir, label)
@@ -222,9 +222,9 @@ def zoning_tab():
 
 def fields_tab():
     st.write("What the model collects for each zone. Each name becomes a column in zones.csv (measurement "
-             "kinds become one column per standard unit, plus _status and _raw); the kind says what sort of "
-             "value it is; the description tells the model what to look for. Saving changes means saved "
-             "zone results are re-queried on the next run.")
+             "kinds become one column per standard unit, plus _status and _raw; every field also gets _pages); "
+             "the kind says what sort of value it is; the description tells the model what to look for. Saving "
+             "changes means saved zone results are re-queried on the next run.")
     st.caption("Kinds and units: " + " · ".join(
         f"**{kind}** → {', '.join(standard_units(kind))}" for kind in KINDS if kind != "text"))
     fields = tomllib.loads(FIELDS_FILE.read_text(encoding="utf-8"))["fields"]

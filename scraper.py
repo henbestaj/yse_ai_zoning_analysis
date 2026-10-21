@@ -7,7 +7,7 @@ Usage:
 import argparse
 from collections import defaultdict
 
-from common import SCRAPER_OUTPUT_DIR, FetchError, Session, read_id_list, write_csv
+from common import DEFAULT_REFRESH_DAYS, SCRAPER_OUTPUT_DIR, FetchError, Session, read_id_list, write_csv
 from towns import waterbury, new_haven
 
 TOWNS = {"waterbury": waterbury,
@@ -20,7 +20,8 @@ def main():
     parser.add_argument("--limit", type=int, help="only scrape the first N parcels in the list")
     parser.add_argument("--ids", nargs="+", help="scrape these parcel IDs instead of the town's list")
     parser.add_argument("--refresh", action="store_true", help="re-download pages even if cached")
-    parser.add_argument("--refresh_days", type=int, default=1, help="re-download cached pages if they are this old")
+    parser.add_argument("--refresh_days", type=int, default=DEFAULT_REFRESH_DAYS,
+                        help=f"re-download cached pages if they are this old (default: {DEFAULT_REFRESH_DAYS})")
     args = parser.parse_args()
 
     town = TOWNS[args.town]
