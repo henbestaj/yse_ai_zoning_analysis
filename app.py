@@ -2,12 +2,15 @@
 
 The app doesn't reimplement anything: it runs the existing command-line scripts (scraper.py,
 zoning.py) as subprocesses, shows their progress, and offers the resulting CSVs for download.
+Colors and fonts come from .streamlit/config.toml (Yale web palette, light and dark mode); the CSS
+below only adds layout touches that work in both modes.
 
 Run from web_scraper/ with the project venv:
     streamlit run app.py
 """
 
 import contextlib
+import html
 import io
 import json
 import os
@@ -29,10 +32,80 @@ from zoning import DOCS_DIR, FIELDS_FILE, KINDS, ZONING_OUTPUT_DIR, default_mode
 
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
 FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PROVIDER_LABELS = {"gemini": "Gemini API", "gcloud": "Google Cloud (Vertex AI)"}
+
+# Mode-independent styling only: Yale Blue bands with white text, #286dc0 accents (passes contrast on
+# both the white and the navy background), and text that inherits the theme's color.
+CSS = """
+<style>
+.block-container { max-width: 1160px; padding-top: 4.25rem; padding-bottom: 3rem; }  /* clears Streamlit's top bar */
+
+.yale-hero {
+  position: relative; overflow: hidden; border-radius: 16px; margin-bottom: 0.75rem;
+  padding: 2.4rem 2.6rem 2.1rem; color: #ffffff;
+  background: linear-gradient(118deg, #00356b 0%, #00356b 55%, #286dc0 100%);
+  border: 1px solid rgba(99, 170, 255, 0.28); box-shadow: 0 14px 34px rgba(0, 53, 107, 0.22);
+}
+.yale-hero::before {  /* a soft light-blue glow in the corner */
+  content: ""; position: absolute; right: -90px; top: -140px; width: 380px; height: 380px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(99, 170, 255, 0.42), rgba(99, 170, 255, 0) 70%);
+}
+.yale-hero::after {  /* faint vertical rules, like a ledger or a lot map */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.045) 0 1px, transparent 1px 72px);
+}
+.yale-hero > * { position: relative; z-index: 1; }
+.yale-hero .eyebrow { font-size: 0.78rem; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 600;
+  color: #63aaff; }
+.yale-hero h1 { font-family: "Crimson Pro", serif; font-weight: 600; font-size: 2.9rem; line-height: 1.1;
+  color: #ffffff !important; margin: 0.35rem 0 0.6rem; padding: 0; }
+.yale-hero p { font-size: 1.06rem; line-height: 1.55; max-width: 46rem; margin: 0; color: rgba(255, 255, 255, 0.9); }
+.yale-hero .chips { margin-top: 1.2rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.yale-hero .chip { font-size: 0.82rem; padding: 0.28rem 0.8rem; border-radius: 999px; color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.32); background: rgba(255, 255, 255, 0.08); }
+
+.stTabs [role="tablist"] { gap: 0.4rem; }
+.stTabs [data-testid="stTab"] { padding: 0.75rem 1rem; }
+.stTabs [data-testid="stTab"] p { font-size: 1.03rem; font-weight: 600; }
+
+/* Selected tab / segment: no single blue is readable as text on the navy background AND as a button
+   behind white text, so selected items keep the theme's text color (bold) and show their state through
+   the primary-colored underline, border and tint instead. */
+.stTabs [data-testid="stTab"][aria-selected="true"],
+.stTabs [data-testid="stTab"][aria-selected="true"] * { color: inherit !important; }
+button[data-variant="segmented_control"][aria-checked="true"],
+button[data-variant="segmented_control"][aria-checked="true"] * { color: inherit !important; font-weight: 600; }
+
+div[class*="st-key-card-"] { border-left: 4px solid #286dc0 !important; padding: 1.2rem 1.4rem 1.3rem !important; }
+.step { display: flex; gap: 0.85rem; align-items: flex-start; }
+.step .num { flex: 0 0 auto; width: 1.9rem; height: 1.9rem; border-radius: 50%; background: #286dc0; color: #ffffff;
+  font-weight: 700; font-size: 0.95rem; display: flex; align-items: center; justify-content: center; margin-top: 0.1rem; }
+.step .num .icon { font-family: "Material Symbols Rounded"; font-weight: 400; font-size: 1.15rem; }
+.step .title { font-family: "Crimson Pro", serif; font-weight: 600; font-size: 1.45rem; line-height: 1.25; }
+.step .sub { font-size: 0.93rem; opacity: 0.72; margin-top: 0.15rem; }
+
+div[data-testid="stMetric"] { border-top: 3px solid #286dc0 !important; }
+
+.yale-footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid rgba(151, 141, 133, 0.35);
+  font-size: 0.85rem; opacity: 0.75; display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+</style>
+"""
 
 
 def town_label(town):
     return town.replace("_", " ").title()
+
+
+@contextlib.contextmanager
+def card(key, step, title, subtitle):
+    """A step: a bordered container (styled through its st-key-card-* class) with a heading. `step` is
+    a number, or a Material icon name (e.g. "tune") for a card that isn't part of a sequence."""
+    badge = step if isinstance(step, int) else f'<span class="icon">{html.escape(step)}</span>'
+    with st.container(border=True, key=f"card-{key}"):
+        st.html(f'<div class="step"><span class="num">{badge}</span><div>'
+                f'<div class="title">{html.escape(title)}</div><div class="sub">{html.escape(subtitle)}</div>'
+                f'</div></div>')
+        yield
 
 
 def run_script(args):
@@ -60,23 +133,23 @@ def run_script(args):
 
 def show_result(code, lines):
     """Green if everything worked, yellow listing the failures if some items failed, red with the
-    last output if the script itself stopped."""
+    last output if the script itself stopped. Each state has its own icon, never color alone."""
     summary = lines[-1] if lines else "Done"
     failures = [line.strip() for line in lines if "FAILED" in line]
     if code != 0:
-        st.error("Stopped with an error:")
+        st.error("Stopped with an error:", icon=":material/error:")
         st.code("\n".join(lines[-10:]))
     elif failures:
-        st.warning(f"{summary}\n\nFailed items:")
+        st.warning(f"{summary}\n\nFailed items:", icon=":material/flag:")
         st.code("\n".join(failures))
     else:
-        st.success(summary)
+        st.success(summary, icon=":material/check_circle:")
 
 
 def read_csv(path):
     try:
         return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
-    except pd.errors.EmptyDataError:  # e.g. errors.csv when nothing failed
+    except (pd.errors.EmptyDataError, FileNotFoundError):  # e.g. errors.csv when nothing failed
         return pd.DataFrame()
 
 
@@ -85,46 +158,74 @@ def download_outputs(folder, label, only=None, key=""):
     `label` prefixes the downloaded file names."""
     files = sorted(p for p in folder.glob("*.csv") if only is None or p.name in only) if folder.is_dir() else []
     if not files:
-        st.info("No output files yet.")
+        st.info("No output files yet.", icon=":material/info:")
         return
     if len(files) > 1:
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in files:
                 zf.write(path, path.name)
-        st.download_button(f"Download all ({len(files)} files, .zip)", buffer.getvalue(),
+        st.download_button(f"Download all ({len(files)} files, .zip)", buffer.getvalue(), icon=":material/folder_zip:",
                            file_name=f"{label}_outputs.zip", mime="application/zip", key=f"zip-{key}{label}")
     for path in files:
         table = read_csv(path)
-        with st.expander(f"{path.name}  ·  {len(table)} rows"):
+        with st.expander(f"{path.name}  ·  {len(table):,} rows", icon=":material/table:"):
             st.download_button(f"Download {path.name}", path.read_bytes(), file_name=f"{label}_{path.name}",
-                               mime="text/csv", key=f"dl-{key}{label}-{path.name}")
+                               mime="text/csv", key=f"dl-{key}{label}-{path.name}", icon=":material/download:")
             st.dataframe(table, width="stretch", hide_index=True)
+
+
+def hero():
+    scraped = [p for p in SCRAPER_OUTPUT_DIR.glob("*/parcels.csv")]
+    runs = list(ZONING_OUTPUT_DIR.glob("*/*/*/zones.csv"))
+    st.html(f"""
+    <div class="yale-hero">
+      <div class="eyebrow">Municipal research tools</div>
+      <h1>Property &amp; Zoning Toolkit</h1>
+      <p>Scrape parcel records from town assessor sites, then have Gemini read a zoning ordinance into a
+         table you can download, with every value traced back to the page it came from.</p>
+      <div class="chips">
+        <span class="chip">{len(scraped)} town{'s' if len(scraped) != 1 else ''} scraped</span>
+        <span class="chip">{len(runs)} zoning table{'s' if len(runs) != 1 else ''} built</span>
+        <span class="chip">Gemini · Vertex AI</span>
+      </div>
+    </div>""")
 
 
 # ---------------------------------------------------------------- Scraping
 
 def scraping_tab():
-    town = st.selectbox("Town", list(TOWNS), format_func=town_label, key="scrape_town")
-    default_ids = read_id_list(TOWNS[town].ID_LIST)
+    with card("scrape-town", 1, "Choose a town", "Each town has its own assessor website and default parcel list."):
+        town = st.segmented_control("Town", list(TOWNS), default=next(iter(TOWNS)), required=True,
+                                    format_func=town_label, key="scrape_town", label_visibility="collapsed")
+        default_ids = read_id_list(TOWNS[town].ID_LIST)
+        parcels = read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv")
+        errors = read_csv(SCRAPER_OUTPUT_DIR / town / "errors.csv")
+        scraped_before = (SCRAPER_OUTPUT_DIR / town / "parcels.csv").exists()
+        last = f"From the last scrape, saved in scraper_output/{town}/"
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Parcels in the town list", f"{len(default_ids):,}", border=True)
+        col2.metric("Scraped", f"{len(parcels):,}" if scraped_before else "–", border=True, help=last)
+        col3.metric("Failed", f"{len(errors):,}" if scraped_before else "–", border=True, help=last)
 
-    source = st.radio("Property IDs", [f"Town's list ({len(default_ids)} IDs)", "Upload a .txt file", "Paste IDs"],
-                      horizontal=True)
-    if source.startswith("Upload"):
-        uploaded = st.file_uploader("One ID per line", type=["txt", "csv"])
-        ids = [line.strip() for line in uploaded.getvalue().decode("utf-8-sig").splitlines()
-               if line.strip()] if uploaded else []
-    elif source.startswith("Paste"):
-        ids = [line.strip() for line in st.text_area("One ID per line").splitlines() if line.strip()]
-    else:
-        ids = default_ids
+    with card("scrape-ids", 2, "Pick the parcels", "Use the town's list, or scrape specific parcel IDs."):
+        source = st.segmented_control("Property IDs", ["Town's list", "Upload a .txt file", "Paste IDs"],
+                                      default="Town's list", required=True, label_visibility="collapsed")
+        if source == "Upload a .txt file":
+            uploaded = st.file_uploader("One ID per line", type=["txt", "csv"])
+            ids = [line.strip() for line in uploaded.getvalue().decode("utf-8-sig").splitlines()
+                   if line.strip()] if uploaded else []
+        elif source == "Paste IDs":
+            ids = [line.strip() for line in st.text_area("One ID per line").splitlines() if line.strip()]
+        else:
+            ids = default_ids
+        with st.expander("Cache settings", icon=":material/history:"):
+            refresh = st.checkbox("Re-download every page, ignoring the cache")
+            refresh_days = st.number_input("Re-download cached pages older than (days)", min_value=0,
+                                           value=DEFAULT_REFRESH_DAYS)
 
-    with st.expander("Options"):
-        refresh = st.checkbox("Re-download every page, ignoring the cache")
-        refresh_days = st.number_input("Re-download cached pages older than (days)", min_value=0,
-                                       value=DEFAULT_REFRESH_DAYS)
-
-    if st.button(f"Scrape {len(ids)} parcels", type="primary", disabled=not ids):
+    if st.button(f"Scrape {len(ids):,} parcels", type="primary", disabled=not ids, width="stretch",
+                 icon=":material/travel_explore:"):
         args = ["scraper.py", "--town", town, "--refresh_days", str(refresh_days)]
         if refresh:
             args.append("--refresh")
@@ -132,8 +233,8 @@ def scraping_tab():
             args += ["--ids", *ids]
         show_result(*run_script(args))
 
-    st.subheader(f"{town_label(town)} output files")
-    download_outputs(SCRAPER_OUTPUT_DIR / town, town, key="scrape-")
+    with card("scrape-results", 3, "Results", f"CSV files from the last {town_label(town)} scrape."):
+        download_outputs(SCRAPER_OUTPUT_DIR / town, town, key="scrape-")
 
 
 # ---------------------------------------------------------------- Zoning
@@ -164,49 +265,70 @@ def document_on_disk(document):
 
 
 def show_zoning_results(results_dir, label):
-    """Let the user pick one run (provider.model.effort folder) and preview/download its zones.csv."""
+    """Let the user pick one run (provider.model.effort folder), summarize it, and preview/download it."""
     runs = sorted(p for p in results_dir.iterdir() if (p / "zones.csv").exists()) if results_dir.is_dir() else []
     if not runs:
-        st.info("No zoning results yet.")
+        st.info("No zoning results yet.", icon=":material/info:")
         return
     run = st.selectbox("Results from (provider.model.effort)", runs, format_func=lambda p: p.name,
                        key=f"run-{results_dir}")
-    download_outputs(run, f"{label}_{run.name}", only={"zones.csv"}, key="zoning-")
+    table = read_csv(run / "zones.csv")
+    found = int((table["found_in_document"] == "True").sum()) if "found_in_document" in table else 0
+    flagged = int((table["flags"] != "").sum()) if "flags" in table else 0
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Zones", f"{len(table):,}", border=True)
+    col2.metric("Found in the document", f"{found} of {len(table)}", border=True)
+    col3.metric("Flagged for review", f"{flagged:,}", border=True,
+                help="Rows with a value that didn't reduce to one number per column; see the flags column")
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.download_button("Download zones.csv", (run / "zones.csv").read_bytes(), icon=":material/download:",
+                       file_name=f"{label}_{run.name}_zones.csv", mime="text/csv", key=f"dl-zones-{run}")
 
 
 def zoning_tab():
-    mode = st.radio("Districts from", ["A scraped town", "A custom list"], horizontal=True)
+    with card("zone-districts", 1, "Choose the districts", "From a town you've scraped, or zone codes you type in."):
+        mode = st.segmented_control("Districts from", ["A scraped town", "A custom list"], default="A scraped town",
+                                    required=True, key="zoning_mode", label_visibility="collapsed")
+        if mode == "A scraped town":
+            towns = sorted(p.name for p in SCRAPER_OUTPUT_DIR.iterdir()
+                           if (p / "parcels.csv").exists()) if SCRAPER_OUTPUT_DIR.is_dir() else []
+            if not towns:
+                st.info("No scraped towns yet. Scrape one first, or use a custom list.", icon=":material/info:")
+                return
+            town = st.segmented_control("Town", towns, default=towns[0], required=True, format_func=town_label,
+                                        key="zoning_town")
+            parcel_columns = list(read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv").columns)
+            col1, col2 = st.columns(2)
+            zone_column = col1.selectbox("Zone column", ["Detect automatically"] + parcel_columns)
+            decider = col2.selectbox("Decider (used if the zone column is unclear)", list(DECIDERS))
+            args = ["--town", town, "--decider", decider]
+            if zone_column != "Detect automatically":
+                args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
+            default_doc, results_dir, label = DOCS_DIR / f"{town}.pdf", ZONING_OUTPUT_DIR / "towns" / town, town
+            doc_hint = "The town's ordinance is used unless you upload another."
+        else:
+            name = st.text_input("Name (e.g. the town or county)").strip()
+            codes = [c.strip() for c in st.text_area("Zone codes, one per line").splitlines() if c.strip()]
+            args = ["--name", name, "--zones", *codes]
+            default_doc = None
+            results_dir, label = ZONING_OUTPUT_DIR / "custom" / safe_name(name or "_"), safe_name(name or "custom")
+            doc_hint = "Upload the ordinance to read."
 
-    if mode == "A scraped town":
-        towns = sorted(p.name for p in SCRAPER_OUTPUT_DIR.iterdir()
-                       if (p / "parcels.csv").exists()) if SCRAPER_OUTPUT_DIR.is_dir() else []
-        if not towns:
-            st.info("No scraped towns yet. Scrape one first, or use a custom list.")
-            return
-        town = st.selectbox("Town", towns, format_func=town_label, key="zoning_town")
-        document = choose_document(DOCS_DIR / f"{town}.pdf", key="town")
-        parcel_columns = list(read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv").columns)
-        col1, col2 = st.columns(2)
-        zone_column = col1.selectbox("Zone column", ["Detect automatically"] + parcel_columns)
-        decider = col2.selectbox("Decider (used if the zone column is unclear)", list(DECIDERS))
-        args = ["--town", town, "--decider", decider]
-        if zone_column != "Detect automatically":
-            args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
-        ready, results_dir, label = document is not None, ZONING_OUTPUT_DIR / "towns" / town, town
-    else:
-        name = st.text_input("Name (e.g. the town or county)").strip()
-        document = choose_document(None, key="custom")
-        codes = [c.strip() for c in st.text_area("Zone codes, one per line").splitlines() if c.strip()]
-        args, ready = ["--name", name, "--zones", *codes], bool(name and document and codes)
-        results_dir, label = ZONING_OUTPUT_DIR / "custom" / safe_name(name or "_"), safe_name(name or "custom")
+    with card("zone-document", 2, "Zoning document", doc_hint):
+        document = choose_document(default_doc, key="town" if mode == "A scraped town" else "custom")
+    ready = document is not None and (mode == "A scraped town" or bool(name and codes))
 
-    col1, col2, col3 = st.columns(3)
-    provider = col1.selectbox("Model provider", list(EXTRACTORS))
-    model_name = col2.text_input("Model name", value=default_model(EXTRACTORS[provider]), key=f"model-{provider}")
-    effort = col3.selectbox("Model effort", ["high", "medium", "low"])
-    refresh = st.checkbox("Re-query every zone, ignoring saved results")
+    with card("zone-model", 3, "Model", "Which Gemini model reads the document, and how much it reasons first."):
+        col1, col2 = st.columns([3, 2])
+        provider = col1.segmented_control("Model provider", list(EXTRACTORS), default=next(iter(EXTRACTORS)),
+                                          required=True, format_func=lambda p: PROVIDER_LABELS.get(p, p))
+        effort = col2.segmented_control("Model effort", ["high", "medium", "low"], default="high", required=True,
+                                        format_func=str.capitalize)
+        model_name = st.text_input("Model name", value=default_model(EXTRACTORS[provider]), key=f"model-{provider}")
+        refresh = st.checkbox("Re-query every zone, ignoring saved results")
 
-    if st.button("Build zoning table", type="primary", disabled=not ready):
+    if st.button("Build zoning table", type="primary", disabled=not ready, width="stretch",
+                 icon=":material/auto_awesome:"):
         with document_on_disk(document) as path:
             args = ["zoning.py", *args, "--doc", str(path), "--model-provider", provider,
                     "--model-name", model_name, "--model-effort", effort]
@@ -214,57 +336,66 @@ def zoning_tab():
                 args.append("--refresh")
             show_result(*run_script(args))
 
-    st.subheader("Zoning results")
-    show_zoning_results(results_dir, label)
+    with card("zone-results", 4, "Results", "One table per provider, model and effort; earlier runs are kept."):
+        show_zoning_results(results_dir, label)
 
 
 # ---------------------------------------------------------------- Fields
 
 def fields_tab():
-    st.write("What the model collects for each zone. Each name becomes a column in zones.csv (measurement "
-             "kinds become one column per standard unit, plus _status and _raw; every field also gets _pages); "
-             "the kind says what sort of value it is; the description tells the model what to look for. Saving "
-             "changes means saved zone results are re-queried on the next run.")
-    st.caption("Kinds and units: " + " · ".join(
-        f"**{kind}** → {', '.join(standard_units(kind))}" for kind in KINDS if kind != "text"))
-    fields = tomllib.loads(FIELDS_FILE.read_text(encoding="utf-8"))["fields"]
-    table = pd.DataFrame({"name": list(fields),
-                          "kind": [spec.get("kind", "text") for spec in fields.values()],
-                          "description": [spec.get("description", "") for spec in fields.values()]})
-    edited = st.data_editor(table, num_rows="dynamic", width="stretch", hide_index=True,
-                            column_config={"name": st.column_config.TextColumn(width="medium"),
-                                           "kind": st.column_config.SelectboxColumn(options=list(KINDS)),
-                                           "description": st.column_config.TextColumn(width="large")})
+    with card("fields", "tune", "What the model collects",
+              "Each row becomes columns in zones.csv. Saving changes means saved zone results are re-queried "
+              "on the next run."):
+        with st.container(horizontal=True, gap="small"):
+            st.badge("text → as written", color="gray")
+            for kind in KINDS:
+                if kind != "text":
+                    st.badge(f"{kind} → {', '.join(standard_units(kind))}", color="blue")
+        st.caption("Measurement kinds become one column per standard unit, plus _status and _raw; every field "
+                   "also gets _pages. The description tells the model what to look for.")
+        fields = tomllib.loads(FIELDS_FILE.read_text(encoding="utf-8"))["fields"]
+        table = pd.DataFrame({"name": list(fields),
+                              "kind": [spec.get("kind", "text") for spec in fields.values()],
+                              "description": [spec.get("description", "") for spec in fields.values()]})
+        edited = st.data_editor(table, num_rows="dynamic", width="stretch", hide_index=True,
+                                height=(len(table) + 2) * 35 + 3,  # every field plus the "add row" line, no scrolling
+                                column_config={"name": st.column_config.TextColumn(width="medium"),
+                                               "kind": st.column_config.SelectboxColumn(options=list(KINDS)),
+                                               "description": st.column_config.TextColumn(width="large")})
 
-    if st.button("Save fields", type="primary"):
-        rows = [tuple(str(r[c] or "").strip() for c in ("name", "kind", "description")) for _, r in edited.iterrows()]
-        rows = [r for r in rows if any(r)]  # ignore fully blank rows
-        problems = [f"'{n}' isn't a valid name (letters, digits, underscores; can't start with a digit)"
-                    for n, _, _ in rows if not FIELD_NAME.match(n)]
-        problems += [f"'{n}' needs a kind" for n, k, _ in rows if k not in KINDS]
-        problems += [f"'{n}' needs a description" for n, _, d in rows if not d]
-        names = [n for n, _, _ in rows]
-        problems += [f"'{n}' appears more than once" for n in sorted({n for n in names if names.count(n) > 1})]
-        if problems:
-            st.error("Not saved:\n\n" + "\n".join(f"- {p}" for p in problems))
-        elif not rows:
-            st.error("Not saved: at least one field is needed.")
-        else:
-            # Keep the explanatory comments at the top of the file (everything before the first line
-            # starting with "[fields."); rewrite the field tables below them
-            header = re.split(r"^\[fields\.", FIELDS_FILE.read_text(encoding="utf-8"), maxsplit=1, flags=re.M)[0]
-            body = "\n".join(f"[fields.{n}]\nkind = {json.dumps(k)}\ndescription = {json.dumps(d, ensure_ascii=False)}\n"
-                             for n, k, d in rows)
-            FIELDS_FILE.write_text(header + body, encoding="utf-8")
-            st.success(f"Saved {len(rows)} fields.")
+        if st.button("Save fields", type="primary", icon=":material/save:"):
+            rows = [tuple(str(r[c] or "").strip() for c in ("name", "kind", "description")) for _, r in edited.iterrows()]
+            rows = [r for r in rows if any(r)]  # ignore fully blank rows
+            problems = [f"'{n}' isn't a valid name (letters, digits, underscores; can't start with a digit)"
+                        for n, _, _ in rows if not FIELD_NAME.match(n)]
+            problems += [f"'{n}' needs a kind" for n, k, _ in rows if k not in KINDS]
+            problems += [f"'{n}' needs a description" for n, _, d in rows if not d]
+            names = [n for n, _, _ in rows]
+            problems += [f"'{n}' appears more than once" for n in sorted({n for n in names if names.count(n) > 1})]
+            if problems:
+                st.error("Not saved:\n\n" + "\n".join(f"- {p}" for p in problems), icon=":material/error:")
+            elif not rows:
+                st.error("Not saved: at least one field is needed.", icon=":material/error:")
+            else:
+                # Keep the explanatory comments at the top of the file (everything before the first line
+                # starting with "[fields."); rewrite the field tables below them
+                header = re.split(r"^\[fields\.", FIELDS_FILE.read_text(encoding="utf-8"), maxsplit=1, flags=re.M)[0]
+                body = "\n".join(f"[fields.{n}]\nkind = {json.dumps(k)}\ndescription = {json.dumps(d, ensure_ascii=False)}\n"
+                                 for n, k, d in rows)
+                FIELDS_FILE.write_text(header + body, encoding="utf-8")
+                st.success(f"Saved {len(rows)} fields.", icon=":material/check_circle:")
 
 
-st.set_page_config(page_title="CT Property & Zoning", layout="wide")
-st.title("CT Property & Zoning")
-scrape, zoning, fields_ = st.tabs(["Scraping", "Zoning table", "Zoning fields"])
+st.set_page_config(page_title="Property & Zoning Toolkit", page_icon=":material/location_city:", layout="wide")
+st.html(CSS)
+hero()
+scrape, zoning, fields_ = st.tabs([":material/travel_explore: Scrape parcels", ":material/map: Build zoning table",
+                                   ":material/tune: Zoning fields"])
 with scrape:
     scraping_tab()
 with zoning:
     zoning_tab()
 with fields_:
     fields_tab()
+st.html('<div class="yale-footer"><span>Model-extracted zoning values can be wrong: check them against the PDF '
+        'pages listed in each _pages column.</span><span>Yale web palette</span></div>')

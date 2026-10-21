@@ -1,0 +1,73 @@
+# Streamlit theme: Yale web palette (yaleidentity.yale.edu), separate light and dark modes.
+#   Blues   #00356b (Yale Blue)  #286dc0  #63aaff
+#   Grays   #222222  #4a4a4a  #978d85  #dddddd  #f9f9f9
+#   Accents #ffd55a (yellow)  #5f712d (green)  #bd5319 (orange)
+# Yale has no red, so errors use the orange accent. Alert tints/texts are shades of the palette
+# colors, chosen to pass WCAG contrast (text >= 4.5:1) in both modes.
+
+# Font names must not end in a digit ("Source Sans 3" breaks the CSS font-family, falling back to Times).
+[theme]
+font = "Public Sans:https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;600;700&display=swap, sans-serif"
+headingFont = "Crimson Pro:https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@600;700&display=swap, serif"
+headingFontWeights = 600
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+linkUnderline = false
+metricValueFontWeight = 600
+
+[theme.light]
+primaryColor = "#00356b"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f9f9f9"
+textColor = "#222222"
+borderColor = "#dddddd"
+linkColor = "#286dc0"
+codeTextColor = "#00356b"
+codeBackgroundColor = "#f9f9f9"
+blueColor = "#286dc0"
+blueBackgroundColor = "rgba(40, 109, 192, 0.10)"
+blueTextColor = "#00356b"
+greenColor = "#5f712d"
+greenBackgroundColor = "rgba(95, 113, 45, 0.13)"
+greenTextColor = "#4a5823"
+yellowColor = "#ffd55a"
+yellowBackgroundColor = "rgba(255, 213, 90, 0.30)"
+yellowTextColor = "#5c4400"
+orangeColor = "#bd5319"
+orangeBackgroundColor = "rgba(189, 83, 25, 0.11)"
+orangeTextColor = "#963f10"
+redColor = "#bd5319"
+redBackgroundColor = "rgba(189, 83, 25, 0.11)"
+redTextColor = "#963f10"
+grayColor = "#978d85"
+grayBackgroundColor = "rgba(151, 141, 133, 0.14)"
+grayTextColor = "#4a4a4a"
+
+[theme.dark]
+primaryColor = "#286dc0"
+backgroundColor = "#0b1a2e"
+secondaryBackgroundColor = "#132640"
+textColor = "#f9f9f9"
+borderColor = "#2a3f5c"
+linkColor = "#63aaff"
+codeTextColor = "#8fc2ff"
+codeBackgroundColor = "#132640"
+blueColor = "#63aaff"
+blueBackgroundColor = "rgba(99, 170, 255, 0.14)"
+blueTextColor = "#8fc2ff"
+greenColor = "#8ca350"
+greenBackgroundColor = "rgba(140, 163, 80, 0.20)"
+greenTextColor = "#c3d29a"
+yellowColor = "#ffd55a"
+yellowBackgroundColor = "rgba(255, 213, 90, 0.16)"
+yellowTextColor = "#ffd55a"
+orangeColor = "#e07a45"
+orangeBackgroundColor = "rgba(224, 122, 69, 0.20)"
+orangeTextColor = "#f4a77c"
+redColor = "#e07a45"
+redBackgroundColor = "rgba(224, 122, 69, 0.20)"
+redTextColor = "#f4a77c"
+grayColor = "#978d85"
+grayBackgroundColor = "rgba(151, 141, 133, 0.20)"
+grayTextColor = "#dddddd"
