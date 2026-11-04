@@ -172,9 +172,11 @@ def read_id_list(path):
     return [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def write_csv(path, rows):
+def write_csv(path, rows, join_lines=True):
     """Write a list of dicts to CSV. Columns are the union of all keys, ordered by the most complete
-    row first so that sections missing from some parcels (e.g. buildings on empty lots) stay in page order."""
+    row first so that sections missing from some parcels (e.g. buildings on empty lots) stay in page order.
+    With join_lines, multi-line values (e.g. mailing addresses) are joined onto one line with ", ";
+    without it, line breaks are kept inside the (quoted) cell."""
     columns = []
     for row in sorted(rows, key=len, reverse=True):
         columns.extend(k for k in row if k not in columns)
@@ -183,6 +185,6 @@ def write_csv(path, rows):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
-        # multi-line values (e.g. mailing addresses) are joined onto one line
-        writer.writerows({k: v.replace("\n", ", ") if isinstance(v, str) else v for k, v in row.items()}
-                         for row in rows)
+        if join_lines:
+            rows = ({k: v.replace("\n", ", ") if isinstance(v, str) else v for k, v in row.items()} for row in rows)
+        writer.writerows(rows)

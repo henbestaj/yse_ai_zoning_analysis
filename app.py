@@ -25,10 +25,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from common import BASE_DIR, DEFAULT_REFRESH_DAYS, SCRAPER_OUTPUT_DIR, read_id_list
+from common import BASE_DIR, DEFAULT_REFRESH_DAYS, SCRAPER_OUTPUT_DIR, load_env, read_id_list
 from models import DECIDERS, EXTRACTORS
 from scraper import TOWNS
-from zoning import DOCS_DIR, FIELDS_FILE, KINDS, ZONING_OUTPUT_DIR, default_model, safe_name, standard_units
+from zoning import DOCS_DIR, FIELDS_FILE, default_model
+from zoning_db import (KINDS, RESULT_STATUSES, count_runs_with_results, default_filename, export_rows, get_engine,
+                       list_runs, run_label, standard_units)
 
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
 FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -175,9 +177,16 @@ def download_outputs(folder, label, only=None, key=""):
             st.dataframe(table, width="stretch", hide_index=True)
 
 
+@st.cache_resource
+def zoning_engine():
+    """One database connection pool for the app (zoning_output/zoning.db unless ZONING_DATABASE_URL is set)."""
+    load_env()
+    return get_engine()
+
+
 def hero():
     scraped = [p for p in SCRAPER_OUTPUT_DIR.glob("*/parcels.csv")]
-    runs = list(ZONING_OUTPUT_DIR.glob("*/*/*/zones.csv"))
+    runs = count_runs_with_results(zoning_engine())
     st.html(f"""
     <div class="yale-hero">
       <div class="eyebrow">Municipal research tools</div>
@@ -186,7 +195,7 @@ def hero():
          table you can download, with every value traced back to the page it came from.</p>
       <div class="chips">
         <span class="chip">{len(scraped)} town{'s' if len(scraped) != 1 else ''} scraped</span>
-        <span class="chip">{len(runs)} zoning table{'s' if len(runs) != 1 else ''} built</span>
+        <span class="chip">{runs} zoning table{'s' if runs != 1 else ''} built</span>
         <span class="chip">Gemini · Vertex AI</span>
       </div>
     </div>""")
@@ -255,38 +264,57 @@ def document_on_disk(document):
     if isinstance(document, Path):
         yield document
         return
-    fd, path = tempfile.mkstemp(suffix=Path(document.name).suffix.lower())  # suffix tells the model the file type
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(document.getvalue())
-        yield Path(path)
-    finally:
-        os.unlink(path)
+    # A temporary folder, so the file keeps its real name (recorded with the run, and its suffix tells the
+    # model the file type); the folder and file are removed when the run ends
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / Path(document.name).name
+        path.write_bytes(document.getvalue())
+        yield path
 
 
-def show_zoning_results(results_dir, label):
-    """Let the user pick one run (provider.model.effort folder), summarize it, and preview/download it."""
-    runs = sorted(p for p in results_dir.iterdir() if (p / "zones.csv").exists()) if results_dir.is_dir() else []
+def show_zoning_results(place_kind, place):
+    """Results for a place from the database. The newest attempt is always reported first, so a failed
+    or interrupted run is never hidden behind older results; then pick any run that has results."""
+    engine = zoning_engine()
+    runs = list_runs(engine, place_kind, place) if place else []
     if not runs:
         st.info("No zoning results yet.", icon=":material/info:")
         return
-    run = st.selectbox("Results from (provider.model.effort)", runs, format_func=lambda p: p.name,
-                       key=f"run-{results_dir}")
-    table = read_csv(run / "zones.csv")
-    found = int((table["found_in_document"] == "True").sum()) if "found_in_document" in table else 0
-    flagged = int((table["flags"] != "").sum()) if "flags" in table else 0
+    with_results = [r for r in runs if r["status"] in RESULT_STATUSES]
+    newest = runs[0]
+    if newest["status"] not in RESULT_STATUSES:
+        message = f"The latest run ({run_label(newest)}) has no results" + (f": {newest['error']}" if newest["error"] else ".")
+        if with_results:
+            message += f"\n\nShowing the most recent run with results instead ({run_label(with_results[0])})."
+        st.error(message, icon=":material/error:")
+    if not with_results:
+        return
+
+    run = st.selectbox("Results from", with_results, format_func=run_label, key=f"run-{place_kind}-{place}")
+    if run["status"] == "partial":
+        st.warning(f"This run is partial: {run['zones_failed']} of {run['zones_requested']} zones are missing"
+                   + (f" ({run['error']})" if run["error"] else "")
+                   + ". Pick an earlier run above if you need them.", icon=":material/flag:")
+    value_format = st.segmented_control("Values format", ["readable", "json"], default="readable", required=True,
+                                        format_func=lambda f: "Readable" if f == "readable" else "JSON",
+                                        key=f"format-{place_kind}-{place}",
+                                        help="How the <field>_values columns are written, on screen and in the download")
+    table = pd.DataFrame(export_rows(engine, run["run_id"], value_format))
+    found = int(table["found_in_document"].sum()) if len(table) else 0
+    flagged = int((table["flags"] != "").sum()) if len(table) else 0
     col1, col2, col3 = st.columns(3)
     col1.metric("Zones", f"{len(table):,}", border=True)
     col2.metric("Found in the document", f"{found} of {len(table)}", border=True)
     col3.metric("Flagged for review", f"{flagged:,}", border=True,
-                help="Rows with a value that didn't reduce to one number per column; see the flags column")
+                help="Rows with a value that needs a person's judgment; see the flags column")
     st.dataframe(table, width="stretch", hide_index=True)
-    st.download_button("Download zones.csv", (run / "zones.csv").read_bytes(), icon=":material/download:",
-                       file_name=f"{label}_{run.name}_zones.csv", mime="text/csv", key=f"dl-zones-{run}")
+    st.download_button("Download CSV", table.to_csv(index=False).encode("utf-8-sig"), icon=":material/download:",
+                       file_name=default_filename(run), mime="text/csv",
+                       key=f"dl-zones-{run['run_id']}-{value_format}")
 
 
 def zoning_tab():
-    with card("zone-districts", 1, "Choose the districts", "From a town you've scraped, or zone codes you type in."):
+    with card("zone-districts", 1, "Choose the districts", "From a town you've scraped, or a custom list you type in or let the model find."):
         mode = st.segmented_control("Districts from", ["A scraped town", "A custom list"], default="A scraped town",
                                     required=True, key="zoning_mode", label_visibility="collapsed")
         if mode == "A scraped town":
@@ -304,19 +332,21 @@ def zoning_tab():
             args = ["--town", town, "--decider", decider]
             if zone_column != "Detect automatically":
                 args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
-            default_doc, results_dir, label = DOCS_DIR / f"{town}.pdf", ZONING_OUTPUT_DIR / "towns" / town, town
+            default_doc, place_kind, place = DOCS_DIR / f"{town}.pdf", "town", town
             doc_hint = "The town's ordinance is used unless you upload another."
         else:
             name = st.text_input("Name (e.g. the town or county)").strip()
-            codes = [c.strip() for c in st.text_area("Zone codes, one per line").splitlines() if c.strip()]
-            args = ["--name", name, "--zones", *codes]
+            codes = [c.strip() for c in st.text_area("Zone codes, one per line (optional)").splitlines() if c.strip()]
+            if not codes:
+                st.caption("No codes: the model lists the document's districts first, leaving out overlay districts.")
+            args = ["--name", name] + (["--zones", *codes] if codes else [])
             default_doc = None
-            results_dir, label = ZONING_OUTPUT_DIR / "custom" / safe_name(name or "_"), safe_name(name or "custom")
+            place_kind, place = "custom", name
             doc_hint = "Upload the ordinance to read."
 
     with card("zone-document", 2, "Zoning document", doc_hint):
         document = choose_document(default_doc, key="town" if mode == "A scraped town" else "custom")
-    ready = document is not None and (mode == "A scraped town" or bool(name and codes))
+    ready = document is not None and (mode == "A scraped town" or bool(name))
 
     with card("zone-model", 3, "Model", "Which Gemini model reads the document, and how much it reasons first."):
         col1, col2 = st.columns([3, 2])
@@ -336,23 +366,25 @@ def zoning_tab():
                 args.append("--refresh")
             show_result(*run_script(args))
 
-    with card("zone-results", 4, "Results", "One table per provider, model and effort; earlier runs are kept."):
-        show_zoning_results(results_dir, label)
+    with card("zone-results", 4, "Results", "Every run is kept; pick an earlier one if you need it."):
+        show_zoning_results(place_kind, place)
 
 
 # ---------------------------------------------------------------- Fields
 
 def fields_tab():
     with card("fields", "tune", "What the model collects",
-              "Each row becomes columns in zones.csv. Saving changes means saved zone results are re-queried "
-              "on the next run."):
+              "Each row becomes columns in the zones table. Saving changes means saved zone results are "
+              "re-queried on the next run."):
         with st.container(horizontal=True, gap="small"):
             st.badge("text → as written", color="gray")
             for kind in KINDS:
                 if kind != "text":
                     st.badge(f"{kind} → {', '.join(standard_units(kind))}", color="blue")
-        st.caption("Measurement kinds become one column per standard unit, plus _status and _raw; every field "
-                   "also gets _pages. The description tells the model what to look for.")
+        st.caption("Measurement kinds get one column per standard unit, filled when the document gives a single "
+                   "general value. Every field also gets _status and _values (each value with its condition, pages "
+                   "and quote); the flags column explains any blanks. The description tells the model what to "
+                   "look for.")
         fields = tomllib.loads(FIELDS_FILE.read_text(encoding="utf-8"))["fields"]
         table = pd.DataFrame({"name": list(fields),
                               "kind": [spec.get("kind", "text") for spec in fields.values()],
@@ -398,4 +430,4 @@ with zoning:
 with fields_:
     fields_tab()
 st.html('<div class="yale-footer"><span>Model-extracted zoning values can be wrong: check them against the PDF '
-        'pages listed in each _pages column.</span><span>Yale web palette</span></div>')
+        'pages and quotes in each _values column.</span><span>Yale web palette</span></div>')

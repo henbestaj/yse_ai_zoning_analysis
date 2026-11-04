@@ -14,10 +14,12 @@
 #   percent  percent                                     -> column_name_percent
 #   density  units_per_acre, sq_ft_per_unit, acres_per_unit -> column_name_units_per_acre
 #   count    count                                       -> column_name
-# Every non-text field also gets column_name_status (stated / not_applicable / not_found) and
-# column_name_raw (the document's exact wording). Every field gets column_name_pages (the PDF pages
-# its value came from). Values that don't reduce to a single number per
-# column (e.g. "the greater of 60 ft or 25 ft per unit") are left blank and listed in "flags".
+# The model returns a list of values for every field, each with an optional condition (e.g. "from any
+# residential district"), the document's exact quote and its pages; a measurement field may also hold
+# text values for requirements that aren't numbers. In the exported CSV, every field also gets
+# column_name_status (stated / not_applicable / not_found) and column_name_values (every value with its
+# condition, pages and quote; readable or JSON). The number columns above hold a value only when exactly
+# one unconditional value has that unit; anything else is left blank and explained in "flags".
 
 [fields.district_name]
 kind = "text"
