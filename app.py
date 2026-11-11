@@ -1,7 +1,8 @@
 """Streamlit UI for the property scraper and the zoning table.
 
 The app doesn't reimplement anything: it runs the existing command-line scripts (scraper.py,
-zoning.py) as subprocesses, shows their progress, and offers the resulting CSVs for download.
+zoning.py) as subprocesses, shows their progress, and shows their results from the scraper and zoning
+databases, with the same CSVs the export commands write available for download.
 Colors and fonts come from .streamlit/config.toml (Yale web palette, light and dark mode); the CSS
 below only adds layout touches that work in both modes.
 
@@ -25,7 +26,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from common import BASE_DIR, DEFAULT_REFRESH_DAYS, SCRAPER_OUTPUT_DIR, load_env, read_id_list
+import scraper_db
+from common import BASE_DIR, DEFAULT_REFRESH_DAYS, csv_bytes, load_env, read_id_list
 from models import DECIDERS, EXTRACTORS
 from scraper import TOWNS
 from zoning import DOCS_DIR, FIELDS_FILE, default_model
@@ -148,32 +150,29 @@ def show_result(code, lines):
         st.success(summary, icon=":material/check_circle:")
 
 
-def read_csv(path):
+def read_csv(data):
+    """CSV file contents (bytes) as a table of text, exactly as written."""
     try:
-        return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
-    except (pd.errors.EmptyDataError, FileNotFoundError):  # e.g. errors.csv when nothing failed
+        return pd.read_csv(io.BytesIO(data), encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError:  # e.g. errors.csv when nothing failed
         return pd.DataFrame()
 
 
-def download_outputs(folder, label, only=None, key=""):
-    """Preview and download buttons for the CSVs in `folder` (all of them, or just the names in `only`).
-    `label` prefixes the downloaded file names."""
-    files = sorted(p for p in folder.glob("*.csv") if only is None or p.name in only) if folder.is_dir() else []
-    if not files:
-        st.info("No output files yet.", icon=":material/info:")
-        return
-    if len(files) > 1:
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path in files:
-                zf.write(path, path.name)
-        st.download_button(f"Download all ({len(files)} files, .zip)", buffer.getvalue(), icon=":material/folder_zip:",
-                           file_name=f"{label}_outputs.zip", mime="application/zip", key=f"zip-{key}{label}")
-    for path in files:
-        table = read_csv(path)
-        with st.expander(f"{path.name}  ·  {len(table):,} rows", icon=":material/table:"):
-            st.download_button(f"Download {path.name}", path.read_bytes(), file_name=f"{label}_{path.name}",
-                               mime="text/csv", key=f"dl-{key}{label}-{path.name}", icon=":material/download:")
+def download_tables(tables, folder):
+    """Preview and download buttons for export_tables() output: one CSV per table, the same files
+    `scraper_db.py export` writes, plus a .zip of them all named after `folder`."""
+    files = {f"{name}.csv": csv_bytes(rows) for name, rows in tables.items()}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(f"{folder}/{name}", data)
+    st.download_button(f"Download all ({len(files)} files, .zip)", buffer.getvalue(), icon=":material/folder_zip:",
+                       file_name=f"{folder}.zip", mime="application/zip", key=f"zip-{folder}")
+    for name, data in files.items():
+        table = read_csv(data)
+        with st.expander(f"{name}  ·  {len(table):,} rows", icon=":material/table:"):
+            st.download_button(f"Download {name}", data, file_name=f"{folder}_{name}", mime="text/csv",
+                               key=f"dl-{folder}-{name}", icon=":material/download:")
             st.dataframe(table, width="stretch", hide_index=True)
 
 
@@ -184,8 +183,15 @@ def zoning_engine():
     return get_engine()
 
 
+@st.cache_resource
+def scraper_engine():
+    """Same, for scraped data (scraper_output/scraper.db unless SCRAPER_DATABASE_URL is set)."""
+    load_env()
+    return scraper_db.get_engine()
+
+
 def hero():
-    scraped = [p for p in SCRAPER_OUTPUT_DIR.glob("*/parcels.csv")]
+    scraped = scraper_db.towns_with_data(scraper_engine())
     runs = count_runs_with_results(zoning_engine())
     st.html(f"""
     <div class="yale-hero">
@@ -208,14 +214,14 @@ def scraping_tab():
         town = st.segmented_control("Town", list(TOWNS), default=next(iter(TOWNS)), required=True,
                                     format_func=town_label, key="scrape_town", label_visibility="collapsed")
         default_ids = read_id_list(TOWNS[town].ID_LIST)
-        parcels = read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv")
-        errors = read_csv(SCRAPER_OUTPUT_DIR / town / "errors.csv")
-        scraped_before = (SCRAPER_OUTPUT_DIR / town / "parcels.csv").exists()
-        last = f"From the last scrape, saved in scraper_output/{town}/"
+        current = scraper_db.export_tables(scraper_engine(), town)
+        scraped_before = bool(scraper_db.list_runs(scraper_engine(), town))
         col1, col2, col3 = st.columns(3)
         col1.metric("Parcels in the town list", f"{len(default_ids):,}", border=True)
-        col2.metric("Scraped", f"{len(parcels):,}" if scraped_before else "–", border=True, help=last)
-        col3.metric("Failed", f"{len(errors):,}" if scraped_before else "–", border=True, help=last)
+        col2.metric("Scraped", f"{len(current['parcels']):,}" if scraped_before else "–", border=True,
+                    help="Parcels with data: each one's latest successful scrape, from any run")
+        col3.metric("Failed", f"{len(current['errors']):,}" if scraped_before else "–", border=True,
+                    help="Parcels whose latest attempt failed (some may still have older data)")
 
     with card("scrape-ids", 2, "Pick the parcels", "Use the town's list, or scrape specific parcel IDs."):
         source = st.segmented_control("Property IDs", ["Town's list", "Upload a .txt file", "Paste IDs"],
@@ -228,9 +234,11 @@ def scraping_tab():
             ids = [line.strip() for line in st.text_area("One ID per line").splitlines() if line.strip()]
         else:
             ids = default_ids
-        with st.expander("Cache settings", icon=":material/history:"):
-            refresh = st.checkbox("Re-download every page, ignoring the cache")
-            refresh_days = st.number_input("Re-download cached pages older than (days)", min_value=0,
+        with st.expander("Stored pages", icon=":material/history:"):
+            st.caption("Every downloaded page is kept in the database; a recent copy is reused instead of "
+                       "downloading the page again.")
+            refresh = st.checkbox("Re-download every page, ignoring stored copies")
+            refresh_days = st.number_input("Re-download pages whose stored copy is older than (days)", min_value=0,
                                            value=DEFAULT_REFRESH_DAYS)
 
     if st.button(f"Scrape {len(ids):,} parcels", type="primary", disabled=not ids, width="stretch",
@@ -242,8 +250,46 @@ def scraping_tab():
             args += ["--ids", *ids]
         show_result(*run_script(args))
 
-    with card("scrape-results", 3, "Results", f"CSV files from the last {town_label(town)} scrape."):
-        download_outputs(SCRAPER_OUTPUT_DIR / town, town, key="scrape-")
+    with card("scrape-results", 3, "Results", "Each parcel's latest successful scrape, or any single run."):
+        show_scrape_results(town)
+
+
+def show_scrape_results(town):
+    """A town's scraped data from the database. A failed newest run is always reported, never hidden
+    behind the current data; stale parcels (newest attempt failed) are counted and flagged."""
+    engine = scraper_engine()
+    runs = scraper_db.list_runs(engine, town)
+    if not runs:
+        st.info("Nothing scraped yet.", icon=":material/info:")
+        return
+    newest = runs[0]
+    with_results = [r for r in runs if r["status"] in RESULT_STATUSES]
+    if newest["status"] not in RESULT_STATUSES:
+        st.error(f"The latest run ({scraper_db.run_label(newest)}) has no results"
+                 + (f": {newest['error']}" if newest["error"] else ".")
+                 + ("\n\nThe current data comes from earlier runs." if with_results else ""), icon=":material/error:")
+    if not with_results:
+        return
+
+    run = st.selectbox("Data from", [None, *with_results], key=f"scrape-run-{town}",
+                       format_func=lambda r: "Current data: each parcel's latest successful scrape" if r is None
+                       else f"Only run {r['run_id']}: {scraper_db.run_label(r)}")
+    tables = scraper_db.export_tables(engine, town, run["run_id"] if run else None)
+    parcels, errors = tables["parcels"], tables["errors"]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Parcels", f"{len(parcels):,}", border=True)
+    if run is None:
+        stale = sum(1 for p in parcels if p["stale"])
+        col2.metric("Stale", f"{stale:,}", border=True,
+                    help="Parcels showing older data because their newest attempt failed; see the stale column")
+        col3.metric("Failed", f"{len(errors):,}", border=True, help="Parcels whose newest attempt failed")
+        if stale:
+            st.warning(f"{stale} parcel(s) show older data because their newest attempt failed; "
+                       "see the stale column in parcels.csv.", icon=":material/flag:")
+    else:
+        col2.metric("Tables", f"{len(tables) - 2:,}", border=True, help="Repeating tables, e.g. sales")
+        col3.metric("Failed in this run", f"{len(errors):,}", border=True)
+    download_tables(tables, scraper_db.default_folder(town, run))
 
 
 # ---------------------------------------------------------------- Zoning
@@ -318,20 +364,21 @@ def zoning_tab():
         mode = st.segmented_control("Districts from", ["A scraped town", "A custom list"], default="A scraped town",
                                     required=True, key="zoning_mode", label_visibility="collapsed")
         if mode == "A scraped town":
-            towns = sorted(p.name for p in SCRAPER_OUTPUT_DIR.iterdir()
-                           if (p / "parcels.csv").exists()) if SCRAPER_OUTPUT_DIR.is_dir() else []
+            towns = scraper_db.towns_with_data(scraper_engine())
             if not towns:
                 st.info("No scraped towns yet. Scrape one first, or use a custom list.", icon=":material/info:")
                 return
             town = st.segmented_control("Town", towns, default=towns[0], required=True, format_func=town_label,
                                         key="zoning_town")
-            parcel_columns = list(read_csv(SCRAPER_OUTPUT_DIR / town / "parcels.csv").columns)
+            parcels = scraper_db.export_tables(scraper_engine(), town)["parcels"]
+            parcel_columns = [c for c in dict.fromkeys(k for row in parcels for k in row)
+                              if c not in scraper_db.EXPORT_COLUMNS]
             col1, col2 = st.columns(2)
             zone_column = col1.selectbox("Zone column", ["Detect automatically"] + parcel_columns)
             decider = col2.selectbox("Decider (used if the zone column is unclear)", list(DECIDERS))
             args = ["--town", town, "--decider", decider]
             if zone_column != "Detect automatically":
-                args += ["--zone-column", f"parcels.csv:{zone_column}"]  # the dropdown lists parcels.csv's columns
+                args += ["--zone-column", f"parcels:{zone_column}"]  # the dropdown lists the parcels table's columns
             default_doc, place_kind, place = DOCS_DIR / f"{town}.pdf", "town", town
             doc_hint = "The town's ordinance is used unless you upload another."
         else:

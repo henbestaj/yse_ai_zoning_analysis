@@ -3,7 +3,8 @@ from a zoning document by a model.
 
 Two ways to say which districts:
     python zoning.py --town new_haven [--doc PATH] [--zone-column NAME] [--decider clef]
-        A town with scraped data in scraper_output/<town>/; the zone codes come from that data.
+        A town with scraped data in the scraper database; the zone codes come from that data (each
+        parcel's latest successful scrape).
         The document defaults to zoning_docs/<town>.pdf.
     python zoning.py --name "Hartford" --doc PATH [--zones RM RL CBD]
         Anything else: give the document and the zone codes. Without --zones, the model lists the
@@ -19,19 +20,19 @@ fields. --refresh redoes every zone. Get results out with: python zoning_db.py e
 """
 
 import argparse
-import csv
 import inspect
 import re
 from pathlib import Path
 
-from common import BASE_DIR, SCRAPER_OUTPUT_DIR, load_env
+import scraper_db
+from common import BASE_DIR, load_env
 from models import DECIDERS, EXTRACTORS, ModelError
 from zoning_db import (KINDS, STATUSES, copy_zone, database_label, fields_sha256, file_sha256, find_reusable,
                        finish_run, get_engine, parse_fields, save_zone, start_run)
 
 DOCS_DIR = BASE_DIR / "zoning_docs"
 FIELDS_FILE = BASE_DIR / "zoning_fields.toml"
-SKIP_FILES = {"errors.csv"}  # scraper output that never holds zone codes
+SKIP_TABLES = {"errors"}  # scraped data that never holds zone codes
 YES_NO = {"yes", "no", "y", "n", "true", "false", "0", "1"}
 CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .\-/]{0,11}$")  # e.g. RM, RM2, BD-1, CBD, I-L
 MIN_CONFIDENCE = 0.6
@@ -47,18 +48,20 @@ def load_fields(path):
 
 
 def load_town_columns(town):
-    """Return {(csv name, column name): [values]} for every CSV the scraper wrote for the town."""
+    """Return {(table name, column name): [values]} from the town's current scraped data (each parcel's
+    latest successful scrape in the scraper database), e.g. ("parcels", "Zone")."""
     columns = {}
-    for path in sorted((SCRAPER_OUTPUT_DIR / town).glob("*.csv")):
-        if path.name in SKIP_FILES:
+    for table, rows in scraper_db.export_tables(scraper_db.get_engine(), town).items():
+        if table in SKIP_TABLES:
             continue
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            for row in csv.DictReader(f):
-                for name, value in row.items():
-                    columns.setdefault((path.name, name), []).append((value or "").strip())
+        for row in rows:
+            for name, value in row.items():
+                if table == "parcels" and name in scraper_db.EXPORT_COLUMNS:
+                    continue  # when and how it was scraped, not data from the site
+                columns.setdefault((table, name), []).append(str(value or "").strip())
     if not columns:
-        raise SystemExit(f"No scraped data in scraper_output/{town}/; run scraper.py --town {town} first, "
-                         f"or use --name with --doc and --zones.")
+        raise SystemExit(f"No scraped data for {town}; run scraper.py --town {town} first, "
+                         f"or use --name with --doc (and optionally --zones).")
     return columns
 
 
@@ -75,7 +78,7 @@ def find_zone_column(place, columns, decider_name):
     candidates = [key for key, values in columns.items()
                   if re.search(r"zon", key[1], re.I) and looks_like_zone_codes(values)]
     if len(candidates) == 1:
-        print(f"Zone column: {candidates[0][1]!r} in {candidates[0][0]} (by rules)")
+        print(f"Zone column: {candidates[0][1]!r} in the {candidates[0][0]} table (by rules)")
         return candidates[0]
 
     pool = candidates or [key for key, values in columns.items() if looks_like_zone_codes(values)]
@@ -84,39 +87,40 @@ def find_zone_column(place, columns, decider_name):
     print(f"Rules found {len(candidates)} candidate zone columns; asking {decider_name}...")
     keys = {f"c{i}": key for i, key in enumerate(pool, 1)}  # neutral option ids; column names may have odd characters
     options = {}
-    for option, (file, name) in keys.items():
-        samples = list(dict.fromkeys(v for v in columns[(file, name)] if v))[:8]
-        options[option] = f"Column '{name}' in {file}. Sample values: {', '.join(samples)}"
+    for option, (table, name) in keys.items():
+        samples = list(dict.fromkeys(v for v in columns[(table, name)] if v))[:8]
+        options[option] = f"Column '{name}' in the {table} table. Sample values: {', '.join(samples)}"
     choice, confidence = DECIDERS[decider_name]().choose(
         state=f"Property records for {place}.",
         instructions="Which column holds each property's zoning district code (e.g. RM, RL, BA-1), "
                      "as defined in the town's zoning ordinance?",
         options=options)
-    file, name = keys[choice]
-    print(f"Zone column: {name!r} in {file} ({decider_name}, confidence {confidence:.2f})")
+    table, name = keys[choice]
+    print(f"Zone column: {name!r} in the {table} table ({decider_name}, confidence {confidence:.2f})")
     if confidence < MIN_CONFIDENCE:
         raise SystemExit(f"Not confident enough ({confidence:.2f} < {MIN_CONFIDENCE}); pass --zone-column NAME.")
-    return file, name
+    return table, name
 
 
 def resolve_zone_column(spec, columns, town):
-    """Turn --zone-column into a (csv name, column name) key. Accepts "parcels.csv:Zone" or just "Zone".
+    """Turn --zone-column into a (table name, column name) key. Accepts "parcels:Zone" or just "Zone".
 
-    File names can't contain ':', so the text before the first ':' is a file name only if it names one
-    of the town's CSVs; otherwise the whole text is the column name (names like "Land: Zone" contain
-    ':' themselves). A bare name found in several files stops with the choices instead of guessing.
+    Table names (parcels, sales, ...) have no ':', so the text before the first ':' is a table name only
+    if it names one of the town's tables; otherwise the whole text is the column name (names like
+    "Land: Zone" contain ':' themselves). A bare name found in several tables stops with the choices
+    instead of guessing.
     """
-    file, sep, name = spec.partition(":")
-    if sep and file in {f for f, _ in columns}:
-        if (file, name) not in columns:
-            raise SystemExit(f"No column named {name!r} in scraper_output/{town}/{file}")
-        return file, name
+    table, sep, name = spec.partition(":")
+    if sep and table in {t for t, _ in columns}:
+        if (table, name) not in columns:
+            raise SystemExit(f"No column named {name!r} in {town}'s {table} table")
+        return table, name
     matches = [key for key in columns if key[1] == spec]
     if not matches:
-        raise SystemExit(f"No column named {spec!r} in scraper_output/{town}/")
+        raise SystemExit(f"No column named {spec!r} in {town}'s scraped data")
     if len(matches) > 1:
-        choices = "\n".join(f'  --zone-column "{f}:{n}"' for f, n in matches)
-        raise SystemExit(f"Column {spec!r} is in {len(matches)} files; say which one:\n{choices}")
+        choices = "\n".join(f'  --zone-column "{t}:{n}"' for t, n in matches)
+        raise SystemExit(f"Column {spec!r} is in {len(matches)} tables; say which one:\n{choices}")
     return matches[0]
 
 
@@ -307,15 +311,15 @@ def default_model(extractor_class):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     which = parser.add_mutually_exclusive_group(required=True)
-    which.add_argument("--town", help="a town with scraped data in scraper_output/<town>/")
+    which.add_argument("--town", help="a town with scraped data in the scraper database")
     which.add_argument("--name", help="any name, for districts not taken from scraped data (needs --doc)")
     parser.add_argument("--doc", type=Path, help="zoning document (with --town, defaults to zoning_docs/<town>.pdf)")
     parser.add_argument("--zones", nargs="+", help="the zone codes to look up, e.g. --zones RM RL CBD "
                                                    "(--name only; leave out to have the model list the districts)")
     parser.add_argument("--list-zones", action="store_true",
                         help="only print the districts the model finds in --doc, then stop (--name only)")
-    parser.add_argument("--zone-column", help='column holding zone codes, e.g. "Zone" or "parcels.csv:Zone" '
-                                              "(--town only; skips detection; name the file if the column is in several)")
+    parser.add_argument("--zone-column", help='column holding zone codes, e.g. "Zone" or "parcels:Zone" '
+                                              "(--town only; skips detection; name the table if the column is in several)")
     parser.add_argument("--decider", choices=DECIDERS,
                         help="decision model used if the zone column is unclear (--town only; default: clef)")
     parser.add_argument("--fields", type=Path, default=FIELDS_FILE, help="fields file (default: zoning_fields.toml)")

@@ -1,7 +1,8 @@
-"""Shared helpers: polite fetching with retries, an on-disk HTML cache, and CSV output."""
+"""Shared helpers: polite fetching with retries, a page cache (stored in the scraper database), and CSV output."""
 
 import csv
 import http.cookiejar
+import io
 import os
 import random
 import time
@@ -13,7 +14,6 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 BASE_DIR = Path(__file__).resolve().parent
-CACHE_DIR = BASE_DIR / "cache"
 SCRAPER_OUTPUT_DIR = BASE_DIR / "scraper_output"
 
 USER_AGENT = (
@@ -43,9 +43,11 @@ def load_env(path=BASE_DIR / ".env"):
 
 
 class Session:
-    """A cookie-keeping HTTP client. Hartford needs one per parcel so the search result stays in the session."""
+    """A cookie-keeping HTTP client, one per parcel (Hartford needs that so the search result stays in the
+    session). `pages` is the parcel scrape's page cache (scraper_db.PageCache), used by cached_fetch."""
 
-    def __init__(self):
+    def __init__(self, pages):
+        self.pages = pages
         self.cookies = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
 
@@ -76,26 +78,27 @@ class Session:
 
 
 def cached_fetch(session, town, parcel_id, page, url, refresh, refresh_days, data=None):
-    """Return the page's HTML, cached at cache/<town>/<parcel_id>_<page>.html.
+    """Return the page's HTML, using the newest stored copy (session.pages) where possible; copies saved
+    by a parcel scrape that failed are never reused.
 
-    The cached copy is used if it's less than `refresh_days` old (and `refresh` is off); otherwise the
-    page is re-downloaded. If that download fails but an older copy exists, the older copy is used
-    with a warning, so a flaky server doesn't cost us a parcel we already have.
+    The stored copy is used if it's less than `refresh_days` old (and `refresh` is off); otherwise the
+    page is re-downloaded and stored, stamped with the parcel scrape's time. If that download fails but an
+    older copy exists, the older copy is used with a warning, so a flaky server doesn't cost us a parcel
+    we already have.
     """
-    path = CACHE_DIR / town / f"{parcel_id}_{page}.html"
-    if path.exists():
-        age = datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    stored = session.pages.latest(town, parcel_id, page)  # (fetched_at, html) or None
+    if stored:
+        age = datetime.now(timezone.utc) - stored[0]
         if not refresh and age < timedelta(days=refresh_days):
-            return path.read_text(encoding="utf-8")
+            return stored[1]
     try:
         html = session.fetch(url, data)
     except FetchError as e:
-        if not path.exists():
-            raise  # nothing cached to fall back on
-        print(f"  warning: {e}; using cached copy from {age.days} day(s) ago")
-        return path.read_text(encoding="utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(html, encoding="utf-8")
+        if not stored:
+            raise  # nothing stored to fall back on
+        print(f"  warning: {e}; using the stored copy from {age.days} day(s) ago")
+        return stored[1]
+    session.pages.save(town, parcel_id, page, url, html)
     return html
 
 
@@ -172,19 +175,25 @@ def read_id_list(path):
     return [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def write_csv(path, rows, join_lines=True):
-    """Write a list of dicts to CSV. Columns are the union of all keys, ordered by the most complete
-    row first so that sections missing from some parcels (e.g. buildings on empty lots) stay in page order.
-    With join_lines, multi-line values (e.g. mailing addresses) are joined onto one line with ", ";
-    without it, line breaks are kept inside the (quoted) cell."""
+def csv_bytes(rows, join_lines=True):
+    """A list of dicts as CSV file contents. Columns are the union of all keys, ordered by the most
+    complete row first so that sections missing from some parcels (e.g. buildings on empty lots) stay in
+    page order. With join_lines, multi-line values (e.g. mailing addresses) are joined onto one line with
+    ", "; without it, line breaks are kept inside the (quoted) cell. Encoded as utf-8-sig so Excel opens
+    it with the right encoding."""
     columns = []
     for row in sorted(rows, key=len, reverse=True):
         columns.extend(k for k in row if k not in columns)
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=columns)
+    writer.writeheader()
+    if join_lines:
+        rows = ({k: v.replace("\n", ", ") if isinstance(v, str) else v for k, v in row.items()} for row in rows)
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def write_csv(path, rows, join_lines=True):
+    """Write a list of dicts to a CSV file (see csv_bytes)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # utf-8-sig so Excel opens it with the right encoding
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
-        if join_lines:
-            rows = ({k: v.replace("\n", ", ") if isinstance(v, str) else v for k, v in row.items()} for row in rows)
-        writer.writerows(rows)
+    path.write_bytes(csv_bytes(rows, join_lines))

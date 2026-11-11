@@ -23,21 +23,19 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import tomllib
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import (REAL, CheckConstraint, Column, DateTime, ForeignKeyConstraint, Integer, MetaData,
-                        PrimaryKeyConstraint, Table, Text, create_engine, event, func, insert, literal,
-                        select, update)
-from sqlalchemy.types import TypeDecorator
+from sqlalchemy import (REAL, Column, ForeignKeyConstraint, Integer, MetaData, PrimaryKeyConstraint, Table, Text,
+                        func, insert, literal, select, update)
 
 from common import BASE_DIR, load_env, write_csv
+# RESULT_STATUSES and database_label are used by zoning.py and app.py through this module
+from db_common import (RESULT_STATUSES, RUN_STATUSES, STRICT, Timestamp, check_in, database_label,  # noqa: F401
+                       make_engine, now_utc, safe_name)
 
 DEFAULT_URL = f"sqlite:///{(BASE_DIR / 'zoning_output' / 'zoning.db').as_posix()}"
-RESULT_STATUSES = ("succeeded", "partial")  # runs that have results to show or reuse
 
 # ---------------------------------------------------------------- field kinds and units
 
@@ -100,37 +98,9 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def safe_name(text):
-    """Make text usable in a file name: characters Windows forbids (< > : " / \\ | ? *) become '-',
-    spaces become '_', and trailing dots are dropped (Windows silently strips them)."""
-    return re.sub(r'[<>:"/\\|?*]', "-", text).replace(" ", "_").rstrip(".")
-
-
 # ---------------------------------------------------------------- tables
 
-class Timestamp(TypeDecorator):
-    """A UTC datetime. SQLite STRICT tables only allow INTEGER, REAL, TEXT, BLOB and ANY, so there it's
-    stored as ISO-8601 text; other databases (e.g. Postgres) get a real timestamp column."""
-
-    impl = DateTime(timezone=True)
-    cache_ok = True
-
-    def load_dialect_impl(self, dialect):
-        return dialect.type_descriptor(Text() if dialect.name == "sqlite" else DateTime(timezone=True))
-
-    def process_bind_param(self, value, dialect):
-        return value.isoformat() if value is not None and dialect.name == "sqlite" else value
-
-    def process_result_value(self, value, dialect):
-        return datetime.fromisoformat(value) if value is not None and dialect.name == "sqlite" else value
-
-
-def _in(column, options):
-    return CheckConstraint(f"{column} IN ({', '.join(repr(o) for o in options)})")
-
-
 metadata = MetaData()
-STRICT = {"sqlite_strict": True}  # enforce column types on SQLite; other databases ignore this
 
 runs = Table(
     "runs", metadata,
@@ -151,10 +121,10 @@ runs = Table(
     Column("zones_requested", Integer, nullable=False),
     Column("zones_from", Text, nullable=False),   # scraped (town data), given (--zones) or model (found in the document)
     Column("zones_failed", Integer),
-    _in("place_kind", ("town", "custom")),
-    _in("zones_from", ("scraped", "given", "model")),
-    _in("effort", ("low", "medium", "high")),
-    _in("status", ("running", "succeeded", "partial", "failed")),
+    check_in("place_kind", ("town", "custom")),
+    check_in("zones_from", ("scraped", "given", "model")),
+    check_in("effort", ("low", "medium", "high")),
+    check_in("status", RUN_STATUSES),
     **STRICT,
 )
 zone_results = Table(
@@ -167,7 +137,7 @@ zone_results = Table(
     PrimaryKeyConstraint("run_id", "zone"),
     ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
     ForeignKeyConstraint(["reused_from_run_id"], ["runs.run_id"]),
-    _in("found_in_document", (0, 1)),
+    check_in("found_in_document", (0, 1)),
     **STRICT,
 )
 field_values = Table(
@@ -179,8 +149,8 @@ field_values = Table(
     Column("status", Text, nullable=False),
     PrimaryKeyConstraint("run_id", "zone", "field"),
     ForeignKeyConstraint(["run_id", "zone"], ["zone_results.run_id", "zone_results.zone"]),
-    _in("kind", tuple(KINDS)),
-    _in("status", STATUSES),
+    check_in("kind", tuple(KINDS)),
+    check_in("status", STATUSES),
     **STRICT,
 )
 # Numbers and text values share one position sequence per field (the order the model gave them), so
@@ -231,29 +201,7 @@ ZONE_TABLES = (zone_results, field_values, number_values, text_values, value_pag
 
 def get_engine(url=None):
     """Connect (creating the database and tables if needed)."""
-    url = url or os.environ.get("ZONING_DATABASE_URL") or DEFAULT_URL
-    if url.startswith("sqlite:///"):
-        Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(url)
-    if engine.dialect.name == "sqlite":
-        @event.listens_for(engine, "connect")
-        def _enforce_foreign_keys(dbapi_connection, _):  # SQLite leaves them unenforced by default
-            dbapi_connection.execute("PRAGMA foreign_keys = ON")
-    metadata.create_all(engine)
-    return engine
-
-
-def database_label(engine):
-    """Where results are stored, for messages: a file path for SQLite (relative to web_scraper/ when
-    inside it), otherwise the URL without its password."""
-    if engine.dialect.name == "sqlite":
-        path = Path(engine.url.database).resolve()
-        return str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(path)
-    return engine.url.render_as_string(hide_password=True)
-
-
-def _now():
-    return datetime.now(timezone.utc)
+    return make_engine(url or os.environ.get("ZONING_DATABASE_URL") or DEFAULT_URL, metadata)
 
 
 # ---------------------------------------------------------------- writing runs
@@ -265,7 +213,7 @@ def start_run(engine, inputs, zones_requested, zones_from):
     """Record a new run as 'running' and return its id. `inputs` holds every runs column from
     place_kind through fields_sha256."""
     with engine.begin() as conn:
-        return conn.execute(insert(runs).values(**inputs, started_at=_now(), status="running",
+        return conn.execute(insert(runs).values(**inputs, started_at=now_utc(), status="running",
                                                 zones_requested=zones_requested,
                                                 zones_from=zones_from)).inserted_primary_key[0]
 
@@ -273,7 +221,7 @@ def start_run(engine, inputs, zones_requested, zones_from):
 def finish_run(engine, run_id, status, zones_failed=0, error=None):
     with engine.begin() as conn:
         conn.execute(update(runs).where(runs.c.run_id == run_id)
-                     .values(status=status, finished_at=_now(), zones_failed=zones_failed, error=error))
+                     .values(status=status, finished_at=now_utc(), zones_failed=zones_failed, error=error))
 
 
 def find_reusable(engine, inputs):
@@ -471,7 +419,7 @@ def export_rows(engine, run_id, value_format="readable"):
                     general = sorted({round(v["standard_value"], 2) for v in numbers
                                       if v["standard_unit"] == unit and not v["condition"]})
                     row[name if spec["kind"] == "count" else f"{name}_{unit}"] = (
-                        _plain(general[0]) if len(general) == 1 else "")
+                        _plain(general[0]) if len(general) == 1 else None)  # None, not "": keep the column numeric
                     if len(general) > 1:
                         flags.append(f"{name}: several general {unit} values "
                                      f"({', '.join(str(_plain(g)) for g in general)})")
