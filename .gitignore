@@ -1,7 +1,6 @@
 __pycache__/
 scraper_output/
 zoning_output/
-cache/
 .claude/
 .venv/
 .env

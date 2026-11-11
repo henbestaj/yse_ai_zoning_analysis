@@ -1,0 +1,10 @@
+[project]
+name = "web-scraper"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "google-genai==2.28.0",
+    "pandas==3.0.6",
+    "sqlalchemy==2.1.6",
+    "streamlit==1.65.0",
+]
