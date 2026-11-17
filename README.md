@@ -107,17 +107,20 @@ A zone already looked up with the same place, model, effort, document and fields
 
 ```
 uv run python zoning_db.py runs --name "Darien"
-uv run python zoning_db.py export --name "Darien"        # newest run with results
-uv run python zoning_db.py export --run 5 --format json
+uv run python zoning_db.py export --name "Darien"        # newest run with results, as a CSV
+uv run python zoning_db.py export --run 5 --values json  # CSV with the _values cells as JSON
+uv run python zoning_db.py export --run 5 --format json --doc "path/to/Darien Zoning.pdf"
 ```
 
 The CSV has one row per district. Each field from `zoning_fields.toml` becomes these columns:
 
 - **A number column in a standard unit**, e.g. `min_lot_area_sq_ft`. It's filled only when the document states exactly one value that applies generally.
 - **`<field>_status`**: `stated`, `not_applicable` or `not_found`.
-- **`<field>_values`**: every value the model found, with its condition, pages and quote.
+- **`<field>_values`**: every value the model found, with its condition, pages and quote. `--values readable` (the default) writes one line per value; `--values json` writes a JSON array.
 
 A `flags` column explains blank or unusual values. Check `_values` before relying on a number.
+
+`--format json` writes the whole run as one nested file instead, for code and the results viewer: the run's details, the fields, then each district's fields with their status, general value, flags and every value (standard and reported units, condition, quote, pages). The `export_json` docstring in `zoning_db.py` describes the layout. `--doc` copies the zoning document next to the JSON as `..._document.pdf`, so page numbers can link to it. It must be the exact file the run used (checked by its contents), and a scraped town's file in `zoning_docs/` is found without it. The app's **Download JSON** button gives the same file without the document copy.
 
 ### Choosing what to collect
 

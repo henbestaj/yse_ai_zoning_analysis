@@ -16,13 +16,15 @@ Tables (one row per ...):
 
 Command line:
     python zoning_db.py runs (--town T | --name N)
-    python zoning_db.py export (--run ID | --town T | --name N) [--format readable|json] [--out FILE]
+    python zoning_db.py export (--run ID | --town T | --name N) [--format csv|json] [--values readable|json]
+                               [--doc PATH] [--out FILE]
 """
 
 import argparse
 import hashlib
 import json
 import os
+import shutil
 import tomllib
 from collections import defaultdict
 from pathlib import Path
@@ -315,10 +317,10 @@ def run_label(run):
     return f"{when} · {run['provider']} / {run['model']} / {run['effort']} · {status}{detail}{source}"
 
 
-def default_filename(run):
+def default_filename(run, extension="csv"):
     when = run["started_at"].astimezone().strftime("%Y-%m-%d_%H%M")
     prefix = "custom_" if run["place_kind"] == "custom" else ""  # so a custom name can't pass for a town
-    return f"{prefix}{safe_name(run['place'])}_{safe_name(run['provider'] + '.' + run['model'] + '.' + run['effort'])}_{when}_zones.csv"
+    return f"{prefix}{safe_name(run['place'])}_{safe_name(run['provider'] + '.' + run['model'] + '.' + run['effort'])}_{when}_zones.{extension}"
 
 
 def _plain(x):
@@ -387,6 +389,40 @@ def format_values(values, value_format):
     return "\n".join(lines)
 
 
+def summarize_field(kind, field_vals, status):
+    """A field's general (unconditional) value and the flags a person should check, as (general, flags).
+    general: for text fields, the general texts joined with "; "; otherwise {standard unit: a number when
+    exactly one general value has that unit, else None (the reason is in flags)}."""
+    if kind == "text":
+        return "; ".join(v["text"] for v in field_vals if "text" in v and not v["condition"]), []
+    general, flags = {}, []
+    numbers = [v for v in field_vals if "number" in v]
+    if any(v["standard_value"] is None for v in numbers):
+        flags.append("a value couldn't be converted to a standard unit")
+    for unit in standard_units(kind):
+        found = sorted({round(v["standard_value"], 2) for v in numbers
+                        if v["standard_unit"] == unit and not v["condition"]})
+        general[unit] = _plain(found[0]) if len(found) == 1 else None
+        if len(found) > 1:
+            flags.append(f"several general {unit} values ({', '.join(str(_plain(g)) for g in found)})")
+    if status == "stated" and not numbers:
+        flags.append("stated, but not as a number")
+    elif numbers and all(v["condition"] for v in numbers):
+        flags.append("only conditional values")
+    return general, flags
+
+
+def _load_run(engine, run_id):
+    """(run, fields, zones sorted by code, {(zone, field): status}, {(zone, field): values})."""
+    run = get_run(engine, run_id)
+    with engine.connect() as conn:
+        zones = conn.execute(select(zone_results).where(zone_results.c.run_id == run_id)).mappings().all()
+        statuses = {(r.zone, r.field): r.status for r in conn.execute(
+            select(field_values).where(field_values.c.run_id == run_id))}
+        values = _load_values(conn, run_id)
+    return run, parse_fields(run["fields_toml"]), sorted(zones, key=lambda z: z["zone"].casefold()), statuses, values
+
+
 def export_rows(engine, run_id, value_format="readable"):
     """A run as CSV rows (one per zone), using the fields file the run itself used:
         <field>                  text fields: the general (unconditional) values, joined with "; "
@@ -395,43 +431,102 @@ def export_rows(engine, run_id, value_format="readable"):
         <field>_status           stated / not_applicable / not_found
         <field>_values           every value with its condition, pages and quote (readable or JSON)
     then flags, found_in_document and notes."""
-    run = get_run(engine, run_id)
-    fields = parse_fields(run["fields_toml"])
-    with engine.connect() as conn:
-        zones = conn.execute(select(zone_results).where(zone_results.c.run_id == run_id)).mappings().all()
-        statuses = {(r.zone, r.field): r.status for r in conn.execute(
-            select(field_values).where(field_values.c.run_id == run_id))}
-        values = _load_values(conn, run_id)
-
+    _, fields, zones, statuses, values = _load_run(engine, run_id)
     rows = []
-    for z in sorted(zones, key=lambda z: z["zone"].casefold()):
+    for z in zones:
         row, flags = {"zone": z["zone"]}, []
         for name, spec in fields.items():
             field_vals = values[(z["zone"], name)]
             status = statuses.get((z["zone"], name), "")
+            general, field_flags = summarize_field(spec["kind"], field_vals, status)
             if spec["kind"] == "text":
-                row[name] = "; ".join(v["text"] for v in field_vals if "text" in v and not v["condition"])
+                row[name] = general
             else:
-                numbers = [v for v in field_vals if "number" in v]
-                if any(v["standard_value"] is None for v in numbers):
-                    flags.append(f"{name}: a value couldn't be converted to a standard unit")
-                for unit in standard_units(spec["kind"]):
-                    general = sorted({round(v["standard_value"], 2) for v in numbers
-                                      if v["standard_unit"] == unit and not v["condition"]})
-                    row[name if spec["kind"] == "count" else f"{name}_{unit}"] = (
-                        _plain(general[0]) if len(general) == 1 else None)  # None, not "": keep the column numeric
-                    if len(general) > 1:
-                        flags.append(f"{name}: several general {unit} values "
-                                     f"({', '.join(str(_plain(g)) for g in general)})")
-                if status == "stated" and not numbers:
-                    flags.append(f"{name}: stated, but not as a number")
-                elif numbers and all(v["condition"] for v in numbers):
-                    flags.append(f"{name}: only conditional values")
+                for unit, number in general.items():  # None, not "": keeps the column numeric
+                    row[name if spec["kind"] == "count" else f"{name}_{unit}"] = number
+            flags += [f"{name}: {flag}" for flag in field_flags]
             row[f"{name}_status"] = status
             row[f"{name}_values"] = format_values(field_vals, value_format)
         row.update(flags="; ".join(flags), found_in_document=bool(z["found_in_document"]), notes=z["notes"])
         rows.append(row)
     return rows
+
+
+def _number(x):
+    """A stored number for JSON, unrounded: 6000.0 -> 6000, 0.115 -> 0.115."""
+    return int(x) if x.is_integer() else x
+
+
+def _when(timestamp):
+    return timestamp.isoformat() if timestamp else None
+
+
+def export_json(engine, run_id, document_file=None):
+    """A run as one nested JSON-ready dict, for code and the results viewer. `document_file` is the
+    name of the document copy saved next to the JSON (pages can then link to it), or None.
+
+    {"format": "zoning-run", "version": 1,
+     "run": {id, place, place_kind, provider, model, effort, status, error, started_at, finished_at
+             (ISO 8601, UTC), zones_requested, zones_failed, zones_from, label},
+     "document": {name, sha256, file},
+     "fields": [{name, kind, description, units}]    in the fields file's order; units = standard units
+     "zones": [{zone, found_in_document, notes, reused_from_run,
+                fields: {<field>: {status, general, flags, values}}}]}
+
+    general and flags are as in summarize_field. Each value is {"text"} or {"value", "unit"} in the
+    standard unit (both None if it couldn't be converted) plus {"reported_value", "reported_unit"} as the
+    document gave it; then condition (None = applies generally), quote and pages (1 = first page of the file)."""
+    run, fields, zones, statuses, values = _load_run(engine, run_id)
+    out_zones = []
+    for z in zones:
+        out_fields = {}
+        for name, spec in fields.items():
+            field_vals = values[(z["zone"], name)]
+            status = statuses.get((z["zone"], name))
+            general, flags = summarize_field(spec["kind"], field_vals, status)
+            items = []
+            for v in field_vals:
+                if "text" in v:
+                    item = {"text": v["text"]}
+                else:
+                    standard = v["standard_value"]
+                    item = {"value": _plain(standard) if standard is not None else None, "unit": v["standard_unit"],
+                            "reported_value": _number(v["number"]), "reported_unit": v["unit"]}
+                items.append({**item, "condition": v["condition"], "quote": v["quote"], "pages": v["pages"]})
+            out_fields[name] = {"status": status, "general": general, "flags": flags, "values": items}
+        out_zones.append({"zone": z["zone"], "found_in_document": bool(z["found_in_document"]), "notes": z["notes"],
+                          "reused_from_run": z["reused_from_run_id"], "fields": out_fields})
+    return {
+        "format": "zoning-run", "version": 1,
+        "run": {"id": run["run_id"], "place": run["place"], "place_kind": run["place_kind"],
+                "provider": run["provider"], "model": run["model"], "effort": run["effort"],
+                "status": run["status"], "error": run["error"],
+                "started_at": _when(run["started_at"]), "finished_at": _when(run["finished_at"]),
+                "zones_requested": run["zones_requested"], "zones_failed": run["zones_failed"],
+                "zones_from": run["zones_from"], "label": run_label(run)},
+        "document": {"name": run["document_name"], "sha256": run["document_sha256"], "file": document_file},
+        "fields": [{"name": name, "kind": spec["kind"], "description": spec["description"],
+                    "units": standard_units(spec["kind"])} for name, spec in fields.items()],
+        "zones": out_zones,
+    }
+
+
+def find_document(run, given=None):
+    """The run's document on disk, checked against the hash stored with the run, or None. `given` is a
+    path from the user: a mismatch is an error. Without one, a town run's file in zoning_docs/ is used if
+    it still matches."""
+    if given is not None:
+        if not given.is_file():
+            raise ValueError(f"No file at {given}.")
+        if file_sha256(given) != run["document_sha256"]:
+            raise ValueError(f"{given.name} isn't the document run {run['run_id']} used ({run['document_name']}): "
+                             "its contents are different, so page numbers wouldn't match.")
+        return given
+    if run["place_kind"] == "town":
+        default = BASE_DIR / "zoning_docs" / run["document_name"]
+        if default.is_file() and file_sha256(default) == run["document_sha256"]:
+            return default
+    return None
 
 
 # ---------------------------------------------------------------- command line
@@ -440,17 +535,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     runs_command = commands.add_parser("runs", help="list a place's runs, newest first")
-    export_command = commands.add_parser("export", help="write a run as a CSV (default: the newest run with results)")
+    export_command = commands.add_parser("export", help="write a run as a CSV or JSON (default: the newest run with results)")
     for command in (runs_command, export_command):
         which = command.add_mutually_exclusive_group(required=True)
         which.add_argument("--town", help="a town key, e.g. new_haven")
         which.add_argument("--name", help="a custom name, as given to zoning.py --name")
         if command is export_command:
             which.add_argument("--run", type=int, help="a specific run id (see the runs command)")
-    export_command.add_argument("--format", choices=["readable", "json"], default="readable",
-                                help="how the <field>_values columns are written (default: readable)")
-    export_command.add_argument("--out", type=Path, help="CSV path (default: [custom_]<place>_<model>_<date>_zones.csv)")
+    export_command.add_argument("--format", choices=["csv", "json"], default="csv",
+                                help="csv: one row per zone (default). json: one nested file with every value, "
+                                     "for code and the results viewer")
+    export_command.add_argument("--values", choices=["readable", "json"],
+                                help="csv only: how the <field>_values columns are written (default: readable)")
+    export_command.add_argument("--doc", type=Path,
+                                help="json only: the run's zoning document, copied next to the JSON so page numbers "
+                                     "can link to it. It must be the exact file the run used. A town's file in "
+                                     "zoning_docs/ is found without this.")
+    export_command.add_argument("--out", type=Path,
+                                help="output path (default: [custom_]<place>_<model>_<date>_zones.csv or .json)")
     args = parser.parse_args()
+    if args.command == "export" and args.format == "json" and args.values:
+        parser.error("--values only applies to --format csv")
+    if args.command == "export" and args.format == "csv" and args.doc:
+        parser.error("--doc only applies to --format json")
     load_env()
     engine = get_engine()
     place_kind, place = ("town", args.town) if args.town else ("custom", args.name)
@@ -476,10 +583,29 @@ def main():
             latest = all_runs[0]
             print(f"Note: the newest run ({latest['run_id']}, {run_label(latest)}) has no results"
                   + (f": {latest['error']}" if latest["error"] else "") + f". Exporting run {run['run_id']} instead.")
-    rows = export_rows(engine, run["run_id"], args.format)
-    out = args.out or Path(default_filename(run))
-    write_csv(out, rows, join_lines=False)
-    print(f"Wrote {len(rows)} zones from run {run['run_id']} ({run_label(run)}) to {out}")
+    out = args.out or Path(default_filename(run, args.format))
+    if args.format == "csv":
+        rows = export_rows(engine, run["run_id"], args.values or "readable")
+        write_csv(out, rows, join_lines=False)
+        print(f"Wrote {len(rows)} zones from run {run['run_id']} ({run_label(run)}) to {out}")
+        return
+
+    try:
+        document = find_document(run, args.doc)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    document_copy = None
+    if document:  # named after the JSON, so the pair stays together (e.g. as release files)
+        document_copy = out.with_name(out.stem.removesuffix("_zones") + "_document" + document.suffix)
+        shutil.copyfile(document, document_copy)
+    data = export_json(engine, run["run_id"], document_copy.name if document_copy else None)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote {len(data['zones'])} zones from run {run['run_id']} ({run_label(run)}) to {out}")
+    if document_copy:
+        print(f"Copied the zoning document to {document_copy}")
+    else:
+        print(f"No document copy, so page numbers won't link to it. To add one: --doc <path to {run['document_name']}>")
 
 
 if __name__ == "__main__":

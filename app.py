@@ -31,8 +31,8 @@ from common import BASE_DIR, DEFAULT_REFRESH_DAYS, csv_bytes, load_env, read_id_
 from models import DECIDERS, EXTRACTORS
 from scraper import TOWNS
 from zoning import DOCS_DIR, FIELDS_FILE, default_model
-from zoning_db import (KINDS, RESULT_STATUSES, count_runs_with_results, default_filename, export_rows, get_engine,
-                       list_runs, run_label, standard_units)
+from zoning_db import (KINDS, RESULT_STATUSES, count_runs_with_results, default_filename, export_json, export_rows,
+                       get_engine, list_runs, run_label, standard_units)
 
 PROGRESS_LINE = re.compile(r"^\[(\d+)/(\d+)\]")  # both scripts print "[3/47] ..." per item
 FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -344,7 +344,7 @@ def show_zoning_results(place_kind, place):
     value_format = st.segmented_control("Values format", ["readable", "json"], default="readable", required=True,
                                         format_func=lambda f: "Readable" if f == "readable" else "JSON",
                                         key=f"format-{place_kind}-{place}",
-                                        help="How the <field>_values columns are written, on screen and in the download")
+                                        help="How the <field>_values columns are written, on screen and in the CSV download")
     table = pd.DataFrame(export_rows(engine, run["run_id"], value_format))
     found = int(table["found_in_document"].sum()) if len(table) else 0
     flagged = int((table["flags"] != "").sum()) if len(table) else 0
@@ -354,9 +354,17 @@ def show_zoning_results(place_kind, place):
     col3.metric("Flagged for review", f"{flagged:,}", border=True,
                 help="Rows with a value that needs a person's judgment; see the flags column")
     st.dataframe(table, width="stretch", hide_index=True)
-    st.download_button("Download CSV", table.to_csv(index=False).encode("utf-8-sig"), icon=":material/download:",
-                       file_name=default_filename(run), mime="text/csv",
-                       key=f"dl-zones-{run['run_id']}-{value_format}")
+    csv_col, json_col = st.columns(2)
+    csv_col.download_button("Download CSV", table.to_csv(index=False).encode("utf-8-sig"), icon=":material/download:",
+                            file_name=default_filename(run), mime="text/csv", width="stretch",
+                            key=f"dl-zones-{run['run_id']}-{value_format}")
+    # The JSON is built only when clicked. It has no document copy (page links need the CLI's --doc)
+    json_col.download_button("Download JSON", lambda: json.dumps(export_json(engine, run["run_id"]), ensure_ascii=False,
+                                                                 indent=2).encode("utf-8"),
+                             icon=":material/data_object:", file_name=default_filename(run, "json"),
+                             mime="application/json", width="stretch", key=f"dl-zones-json-{run['run_id']}",
+                             help="Every value with its condition, quote and pages, in one nested file for code "
+                                  "or the results viewer. The Values format setting doesn't apply.")
 
 
 def zoning_tab():
