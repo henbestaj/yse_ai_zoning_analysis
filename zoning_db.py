@@ -355,7 +355,7 @@ def _load_values(conn, run_id):
 
 
 def format_values(values, value_format):
-    """The <field>_values cell: one readable line per value, or a JSON array. Empty if no values."""
+    """The <field>_values cell: one readable line per value, or a pretty-printed JSON array. Empty if no values."""
     if not values:
         return ""
     if value_format == "json":
@@ -368,7 +368,7 @@ def format_values(values, value_format):
             else:  # couldn't convert (e.g. 0 sq ft per unit): give it as reported
                 item = {"value": _plain(v["number"]), "unit": v["unit"]}
             items.append({**item, "condition": v["condition"], "pages": v["pages"], "quote": v["quote"]})
-        return json.dumps(items, ensure_ascii=False)
+        return json.dumps(items, ensure_ascii=False, indent=2)
     lines = []
     for v in values:
         if "text" in v:
