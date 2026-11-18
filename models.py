@@ -18,6 +18,7 @@ import json
 import math
 import mimetypes
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +27,28 @@ import warnings
 
 class ModelError(Exception):
     pass
+
+
+def _interruptible(fn, *args):
+    """Call fn(*args) on a background thread and wait for it in short steps, so Ctrl+C stops the program
+    right away. On Windows, Python only acts on Ctrl+C between steps of its own code, so a long network
+    read (a model reply can take minutes) would otherwise hold it up. On Ctrl+C the request is abandoned
+    (the thread is a daemon, so it doesn't keep the program alive); fn's own errors are re-raised here."""
+    outcome = {}
+
+    def target():
+        try:
+            outcome["value"] = fn(*args)
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(0.2)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def _require_env(name):
@@ -82,8 +105,8 @@ class GeminiExtractor:
         while attempts < self.max_attempts:
             try:
                 if document not in self._documents:
-                    self._documents[document] = self._prepare(document)
-                result = json.loads(self._generate(self._documents[document], prompt, schema))
+                    self._documents[document] = _interruptible(self._prepare, document)
+                result = json.loads(_interruptible(self._generate, self._documents[document], prompt, schema))
                 validate(result)
                 return result
             except self.errors.APIError as e:
@@ -167,9 +190,12 @@ class ClefDecider:
         request = urllib.request.Request(
             self.url, data=json.dumps(body).encode(), method="POST",
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-        try:
+        def send():
             with urllib.request.urlopen(request, timeout=60) as response:
-                data = json.loads(response.read())
+                return json.loads(response.read())
+
+        try:
+            data = _interruptible(send)
         except urllib.error.HTTPError as e:
             raise ModelError(f"Clef API error {e.code}: {e.read()[:300]!r}") from e
         data = data.get("result", data)  # Cloudflare's REST API wraps payloads in {"result": ...}
