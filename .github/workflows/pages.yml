@@ -1,0 +1,73 @@
+# Publishes the zoning results viewer (site/) to GitHub Pages, along with every run attached to a release.
+# See site/README.md for how to publish runs.
+#
+# When it runs:
+#   - a release is published, unpublished or deleted (to add or remove runs)
+#   - the viewer's code changes on main
+#   - by hand: the Actions tab -> "Publish results viewer" -> Run workflow (or: gh workflow run pages.yml)
+
+name: Publish results viewer
+
+on:
+  release:
+    types: [published, unpublished, deleted]
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+jobs:
+  # A release event runs on the release's tag, and Pages only deploys from main unless told otherwise,
+  # so a release just starts a normal run on main, which does the deploy below.
+  start-from-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # to start the workflow
+    steps:
+      - run: gh workflow run pages.yml --ref "${{ github.event.repository.default_branch }}" --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  deploy:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # to read the site and download release files
+      pages: write     # to deploy to Pages
+      id-token: write  # required by deploy-pages
+    concurrency:       # one deploy at a time; a newer one waits instead of cancelling one in progress
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Gather the viewer and every release's results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site/data _downloads
+          cp site/index.html site/app.js site/style.css _site/
+          # Oldest release first, so if two releases have a file with the same name, the newer one wins
+          gh release list --limit 1000 --exclude-drafts --json tagName --jq '.[].tagName' | tac | while read -r tag; do
+            echo "Release $tag"
+            mkdir -p "_downloads/$tag"
+            if gh release download "$tag" --dir "_downloads/$tag" --pattern '*.json' --pattern '*.pdf'; then
+              cp "_downloads/$tag"/* _site/data/
+            else
+              echo "  no .json or .pdf files in this release"
+            fi
+          done
+          python3 site/build_index.py _site/data
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -5,6 +5,7 @@ Tools for collecting Connecticut property and zoning data:
 - **Property scraper**: downloads the public assessor record for each parcel in a list (currently Waterbury and New Haven) and saves it to a database.
 - **Zoning tool**: sends a town's zoning ordinance (PDF) to a Gemini model and builds a table with one row per zoning district: minimum lot area, setbacks, height, density, permitted uses, and so on. Every value comes with the exact quote and page it was taken from.
 - **Streamlit app**: does both of the above from a browser, with downloads of the results.
+- **Results viewer**: a website (GitHub Pages) where reviewers read and check zoning results district by district, with each value's quote and a link to its page in the PDF.
 
 Every run is saved and never overwritten, so earlier results stay available and you can always see where a value came from.
 
@@ -103,6 +104,8 @@ All three forms take these options:
 
 A zone already looked up with the same place, model, effort, document and fields file is copied from the earlier run, with no model call. If a run fails partway, rerunning the same command only queries the zones that are missing. `--refresh` redoes every zone.
 
+Stop a run with Ctrl+C, which takes effect right away and records the run as stopped. Closing or killing the terminal instead leaves the run marked `running`, and its finished zones won't be reused until it's marked as ended.
+
 ### Exporting
 
 ```
@@ -121,6 +124,10 @@ The CSV has one row per district. Each field from `zoning_fields.toml` becomes t
 A `flags` column explains blank or unusual values. Check `_values` before relying on a number.
 
 `--format json` writes the whole run as one nested file instead, for code and the results viewer: the run's details, the fields, then each district's fields with their status, general value, flags and every value (standard and reported units, condition, quote, pages). The `export_json` docstring in `zoning_db.py` describes the layout. `--doc` copies the zoning document next to the JSON as `..._document.pdf`, so page numbers can link to it. It must be the exact file the run used (checked by its contents), and a scraped town's file in `zoning_docs/` is found without it. The app's **Download JSON** button gives the same file without the document copy.
+
+### Sharing results in the viewer
+
+The results viewer in `site/` is the easiest way for people who don't use these tools to read a run. To publish runs, export them with `--format json` (plus `--doc` for page links) and attach the files to a GitHub release; a workflow then deploys them to the site. Anyone can also open the site, or `site/index.html` from disk, and drop in a JSON file to look at it without publishing. Setup, publishing and local previews are in [site/README.md](site/README.md).
 
 ### Choosing what to collect
 
@@ -149,6 +156,8 @@ Both are SQLite. Set `SCRAPER_DATABASE_URL` or `ZONING_DATABASE_URL` to use a di
 | `db_common.py` | database code shared by both databases |
 | `common.py` | HTTP fetching with retries, HTML table parsing, CSV writing |
 | `app.py` | the Streamlit app |
+| `site/` | the results viewer (static HTML/JS/CSS); see [site/README.md](site/README.md) |
+| `.github/workflows/pages.yml` | deploys the viewer and the released runs to GitHub Pages |
 
 ### Adding a town
 

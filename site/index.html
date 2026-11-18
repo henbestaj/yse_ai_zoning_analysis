@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Zoning Results Viewer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2300356b'/%3E%3Crect x='3' y='3' width='4' height='4' fill='%23fff'/%3E%3Crect x='9' y='3' width='4' height='4' fill='%23fff' opacity='.6'/%3E%3Crect x='3' y='9' width='4' height='4' fill='%23fff' opacity='.6'/%3E%3Crect x='9' y='9' width='4' height='4' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="logo" aria-hidden="true"></span>Zoning Results Viewer</a>
+    <span class="topbar-note">What the model read in each zoning document, with the source of every value</span>
+  </header>
+  <div id="problem" class="banner error page-problem" role="alert" hidden></div>
+  <main id="app"><p class="loading">Loading…</p></main>
+  <footer class="footer">
+    Values were read from each town's zoning regulations by a language model. Check them against the quoted
+    text and the document before relying on them.
+  </footer>
+  <input type="file" id="file-input" accept=".json,.pdf,application/json,application/pdf" multiple hidden>
+  <noscript><p class="banner error">This viewer needs JavaScript turned on.</p></noscript>
+</body>
+</html>

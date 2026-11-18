@@ -74,8 +74,8 @@ def make_engine(url, metadata):
 
 
 def database_label(engine):
-    """Where data is stored, for messages: a file path for SQLite (relative to web_scraper/ when
-    inside it), otherwise the URL without its password."""
+    """Where data is stored, for messages: a file path for SQLite (relative to the project folder
+    when inside it), otherwise the URL without its password."""
     if engine.dialect.name == "sqlite":
         path = Path(engine.url.database).resolve()
         return str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(path)

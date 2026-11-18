@@ -54,7 +54,7 @@ def _interruptible(fn, *args):
 def _require_env(name):
     value = os.environ.get(name)
     if not value:
-        raise ModelError(f"{name} is not set (add it to web_scraper/.env)")
+        raise ModelError(f"{name} is not set (add it to .env in the project folder)")
     return value
 
 

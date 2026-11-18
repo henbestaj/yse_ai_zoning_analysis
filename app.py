@@ -6,8 +6,8 @@ databases, with the same CSVs the export commands write available for download.
 Colors and fonts come from .streamlit/config.toml (Yale web palette, light and dark mode); the CSS
 below only adds layout touches that work in both modes.
 
-Run from web_scraper/ with the project venv:
-    streamlit run app.py
+Run from the project folder:
+    uv run streamlit run app.py
 """
 
 import contextlib
@@ -113,7 +113,7 @@ def card(key, step, title, subtitle):
 
 
 def run_script(args):
-    """Run `python <args>` in web_scraper/, showing the current item above a progress bar.
+    """Run `python <args>` in the project folder, showing the current item above a progress bar.
     Returns (exit code, output lines)."""
     progress = st.progress(0.0, text="Starting...")
     lines = []
